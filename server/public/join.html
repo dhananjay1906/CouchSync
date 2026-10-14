@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="couchsync-join" content="1">
+<title>Join a CouchSync party</title>
+<style>
+  :root { --bg:#0f1115; --card:#181b22; --text:#eef0f4; --muted:#9aa3b2; --accent:#ff6b4a; }
+  * { box-sizing: border-box; }
+  body { margin:0; min-height:100vh; display:grid; place-items:center; background:var(--bg); color:var(--text); font:16px/1.5 system-ui, -apple-system, Segoe UI, sans-serif; padding:16px; }
+  .card { background:var(--card); border-radius:16px; padding:28px; max-width:440px; width:100%; }
+  h1 { margin:0 0 4px; font-size:24px; }
+  p { color:var(--muted); margin:8px 0; }
+  .title { color:var(--text); font-weight:600; }
+  button { width:100%; margin-top:18px; padding:14px; border:0; border-radius:10px; background:var(--accent); color:#fff; font-size:16px; font-weight:600; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  .hidden { display:none; }
+  code { background:#000; padding:2px 6px; border-radius:6px; }
+  ol { color:var(--muted); padding-left:20px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>🍿 You're invited</h1>
+  <p id="info">Loading party…</p>
+  <div id="has-ext" class="hidden">
+    <button id="join">Join party</button>
+    <p id="after" class="hidden">Opening the video… If the CouchSync panel didn't open, click the CouchSync icon in your toolbar.</p>
+  </div>
+  <div id="no-ext" class="hidden">
+    <p>You need the CouchSync extension in Chrome (or Edge/Brave) first:</p>
+    <ol>
+      <li>Get the <code>extension</code> folder from whoever invited you.</li>
+      <li>Open <code>chrome://extensions</code>, turn on <b>Developer mode</b>.</li>
+      <li>Click <b>Load unpacked</b> and pick the folder.</li>
+      <li>Reload this page.</li>
+    </ol>
+  </div>
+</div>
+<script>
+  const room = location.pathname.split('/').filter(Boolean)[1] || '';
+  const info = document.getElementById('info');
+  let media = null;
+  fetch('/api/room/' + encodeURIComponent(room)).then(r => r.ok ? r.json() : Promise.reject())
+    .then(d => {
+      media = d.media;
+      const who = `${d.members}/${d.maxMembers} people in the party.`;
+      info.innerHTML = '';
+      const t = document.createElement('span');
+      t.className = 'title';
+      t.textContent = d.media && d.media.title ? d.media.title : 'Host hasn\'t picked a video yet';
+      info.append(t, document.createElement('br'), who);
+      document.documentElement.dataset.room = room;
+    })
+    .catch(() => { info.textContent = 'This party has ended or the link is wrong. Ask for a new link.'; });
+
+  // The extension marks the page when it is installed.
+  setTimeout(() => {
+    const ok = document.documentElement.dataset.couchsyncExt === '1';
+    document.getElementById(ok ? 'has-ext' : 'no-ext').classList.remove('hidden');
+  }, 600);
+
+  document.getElementById('join').addEventListener('click', e => {
+    e.target.disabled = true;
+    window.postMessage({ source: 'couchsync-join-page', room, server: location.origin, media }, location.origin);
+    document.getElementById('after').classList.remove('hidden');
+  });
+</script>
+</body>
+</html>

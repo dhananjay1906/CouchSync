@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CouchSync — camera & mic</title>
+<style>
+  body { margin:0; min-height:100vh; display:grid; place-items:center; background:#0f1115; color:#eef0f4; font:16px/1.5 system-ui, sans-serif; padding:16px; box-sizing:border-box; }
+  .card { background:#181b22; border-radius:16px; padding:28px; max-width:460px; }
+  h1 { margin:0 0 8px; font-size:22px; }
+  p { color:#9aa3b2; }
+  button { margin-top:12px; padding:12px 18px; border:0; border-radius:10px; background:#ff6b4a; color:#fff; font:600 16px system-ui; cursor:pointer; }
+  video { width:100%; border-radius:10px; margin-top:12px; transform:scaleX(-1); background:#000; }
+  .ok { color:#3ccf8e; } .bad { color:#ff5470; }
+  code { background:#000; padding:2px 6px; border-radius:6px; font-size:13px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>📷 Turn on camera & mic</h1>
+  <p>Chrome can't ask for camera access inside the side panel, so we ask here once. Your video only goes directly to friends in your party.</p>
+  <button id="go">Allow camera & microphone</button>
+  <p id="msg"></p>
+  <video id="preview" autoplay muted playsinline hidden></video>
+</div>
+<script src="permission.js"></script>
+</body>
+</html>

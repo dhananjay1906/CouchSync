@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "CouchSync",
+  "version": "1.0.0",
+  "description": "Watch together in sync with up to 4 friends — live video chat and chat on the side. Free, self-hosted.",
+  "minimum_chrome_version": "116",
+  "permissions": ["storage", "sidePanel", "tabs", "scripting"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js" },
+  "action": {
+    "default_title": "CouchSync — open watch party",
+    "default_icon": { "16": "icons/16.png", "32": "icons/32.png", "48": "icons/48.png", "128": "icons/128.png" }
+  },
+  "side_panel": { "default_path": "panel.html" },
+  "icons": { "16": "icons/16.png", "32": "icons/32.png", "48": "icons/48.png", "128": "icons/128.png" },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "all_frames": true,
+      "match_about_blank": true,
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://www.netflix.com/*"],
+      "js": ["netflix-main.js"],
+      "world": "MAIN",
+      "run_at": "document_idle"
+    }
+  ]
+}

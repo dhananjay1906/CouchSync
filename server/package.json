@@ -1,0 +1,20 @@
+{
+  "name": "couchsync-server",
+  "version": "1.0.0",
+  "description": "CouchSync watch-party sync + signaling server",
+  "main": "server.js",
+  "directories": {
+    "test": "test"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/test.js"
+  },
+  "dependencies": {
+    "ws": "^8.22.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "private": true
+}
