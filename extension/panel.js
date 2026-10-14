@@ -574,13 +574,14 @@ async function startLocalMedia(fromPermissionPage) {
   }
   const stream = await getStream();
   if (!stream) {
-    addSystem('Could not start camera/mic (is another app using it?). You can still watch and see friends.');
+    notifyOnce('busy', 'Could not start camera/mic (is another app using it?). You can still watch and see friends.');
     camOn = false; micOn = false;
     updateMediaButtons();
     return;
   }
   if (localStream) localStream.getTracks().forEach(tr => tr.stop());
   localStream = stream;
+  stream.getTracks().forEach(watchEnded);
   camOn = stream.getVideoTracks().length > 0;
   micOn = stream.getAudioTracks().length > 0;
   t.video.srcObject = stream;
@@ -592,46 +593,108 @@ async function startLocalMedia(fromPermissionPage) {
   updateMediaButtons();
 }
 
-function openPermissionPage() {
-  chrome.tabs.create({ url: chrome.runtime.getURL('permission.html') });
+let permissionTabOpening = false;
+async function openPermissionPage() {
+  if (permissionTabOpening) return;
+  permissionTabOpening = true;
+  try {
+    // Reuse an already-open permission tab instead of piling up new ones.
+    const url = chrome.runtime.getURL('permission.html');
+    const [existing] = await chrome.tabs.query({ url });
+    if (existing) await chrome.tabs.update(existing.id, { active: true });
+    else await chrome.tabs.create({ url });
+  } catch {} finally {
+    setTimeout(() => { permissionTabOpening = false; }, 1500);
+  }
 }
 
-async function toggleMic() {
-  if (!localStream || !localStream.getAudioTracks().length) {
-    if ((await mediaPermissionState()) !== 'granted') return openPermissionPage();
-    return startLocalMedia(true);
+// Say each problem once, not once per click.
+const lastNotice = new Map();
+function notifyOnce(key, text, ms = 15000) {
+  if (Date.now() - (lastNotice.get(key) || 0) < ms) return;
+  lastNotice.set(key, Date.now());
+  addSystem(text);
+}
+
+const liveTracks = kind => (localStream ? localStream.getTracks().filter(t => t.kind === kind && t.readyState === 'live') : []);
+
+// Get one more device (camera or mic) without touching the one we already have.
+async function acquire(kind) {
+  if ((await mediaPermissionState()) !== 'granted') {
+    notifyOnce('perm', 'Camera/mic permission expired or was never saved. A tab opened — click Allow and pick "Forever"/"Allow on every visit".');
+    openPermissionPage();
+    return false;
   }
-  micOn = !micOn;
-  localStream.getAudioTracks().forEach(tr => { tr.enabled = micOn; });
-  mesh.setMediaState({ mic: micOn });
+  const V = { width: { ideal: 320 }, height: { ideal: 240 }, frameRate: { ideal: 15, max: 15 } };
+  const A = { echoCancellation: true, noiseSuppression: true, autoGainControl: true };
+  const constraints = kind === 'both' ? { video: V, audio: A } : kind === 'video' ? { video: V } : { audio: A };
+  try {
+    const s = await navigator.mediaDevices.getUserMedia(constraints);
+    if (!localStream) localStream = new MediaStream();
+    s.getTracks().forEach(tr => { watchEnded(tr); localStream.addTrack(tr); });
+    return true;
+  } catch (e) {
+    if (e.name === 'NotAllowedError') {
+      notifyOnce('perm', 'Chrome/Brave blocked the camera/mic. A tab opened to fix it — click Allow and pick "Forever".');
+      openPermissionPage();
+    } else if (e.name === 'NotReadableError') {
+      notifyOnce('busy', `Your ${kind === 'video' ? 'camera' : 'mic'} is being used by another app (Zoom, Teams…). Close it and try again.`);
+    } else {
+      notifyOnce('dev-' + e.name, `${kind === 'video' ? 'Camera' : 'Mic'} unavailable (${e.name}).`);
+    }
+    return false;
+  }
+}
+
+// If the OS or browser takes the device away (unplugged, permission revoked), reflect it in the UI.
+function watchEnded(track) {
+  track.addEventListener('ended', () => {
+    if (track.kind === 'video') camOn = false; else micOn = false;
+    if (mesh) { mesh.setLocalStream(localStream); mesh.setMediaState({ cam: camOn, mic: micOn }); }
+    refreshTileVideo('self');
+    updateMediaButtons();
+  });
+}
+
+async function applyLocalChange() {
+  // Muted/off tracks stay open (so no new permission is ever needed) but are not sent to friends.
+  liveTracks('audio').forEach(t => { t.enabled = micOn; });
+  liveTracks('video').forEach(t => { t.enabled = camOn; });
+  await mesh.setLocalStream(localStream);
+  mesh.setMediaState({ cam: camOn, mic: micOn });
+  const sv = tiles.get('self').video;
+  if (sv.srcObject !== localStream) { sv.srcObject = localStream; }
+  sv.play().catch(() => {});
+  if (liveTracks('audio').length) watchLevel('self', localStream);
+  refreshTileVideo('self');
   updateMediaButtons();
+}
+
+let toggling = false;
+async function toggleMic() {
+  if (toggling) return;
+  toggling = true;
+  try {
+    if (!liveTracks('audio').length && !liveTracks('video').length) {
+      if (!(await acquire('both')) && !(await acquire('audio'))) return;
+      micOn = true; camOn = liveTracks('video').length > 0;
+    } else if (!liveTracks('audio').length) { if (!(await acquire('audio'))) return; micOn = true; }
+    else micOn = !micOn;
+    await applyLocalChange();
+  } finally { toggling = false; }
 }
 
 async function toggleCam() {
-  if (!localStream) {
-    if ((await mediaPermissionState()) !== 'granted') return openPermissionPage();
-    return startLocalMedia(true);
-  }
-  if (camOn) {
-    // Fully stop the camera so its light turns off and no bandwidth is used.
-    localStream.getVideoTracks().forEach(tr => { tr.stop(); localStream.removeTrack(tr); });
-    camOn = false;
-  } else {
-    try {
-      const s = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 320 }, height: { ideal: 240 }, frameRate: { ideal: 15, max: 15 } } });
-      s.getVideoTracks().forEach(tr => localStream.addTrack(tr));
-      camOn = true;
-    } catch (e) {
-      addSystem(`Camera unavailable (${e.name}).`);
-    }
-  }
-  await mesh.setLocalStream(localStream);
-  mesh.setMediaState({ cam: camOn });
-  const sv = tiles.get('self').video;
-  sv.srcObject = localStream;
-  sv.play().catch(() => {});
-  refreshTileVideo('self');
-  updateMediaButtons();
+  if (toggling) return;
+  toggling = true;
+  try {
+    if (!liveTracks('audio').length && !liveTracks('video').length) {
+      if (!(await acquire('both')) && !(await acquire('video'))) return;
+      camOn = liveTracks('video').length > 0; micOn = liveTracks('audio').length > 0;
+    } else if (!liveTracks('video').length) { if (!(await acquire('video'))) return; camOn = true; }
+    else camOn = !camOn; // just pause sending; the camera light turns off shortly while disabled
+    await applyLocalChange();
+  } finally { toggling = false; }
 }
 
 function updateMediaButtons() {
@@ -688,6 +751,23 @@ setInterval(() => {
   }
 }, 150);
 
+// Browsers can block sound until you click in the page. Show a button instead of failing silently.
+function playRemote(t) {
+  t.video.play().then(updateSoundButton).catch(err => {
+    if (err.name === 'NotAllowedError') $('enable-sound').classList.remove('hidden');
+  });
+}
+function updateSoundButton() {
+  const blocked = [...tiles.entries()].some(([id, t]) => id !== 'self' && t.video.srcObject && t.video.paused);
+  $('enable-sound').classList.toggle('hidden', !blocked);
+}
+$('enable-sound').addEventListener('click', () => {
+  getAudioCtx();
+  tiles.forEach((t, id) => { if (id !== 'self' && t.video.srcObject) { t.video.muted = false; t.video.play().catch(() => {}); } });
+  setTimeout(updateSoundButton, 500);
+});
+setInterval(updateSoundButton, 2000);
+
 function createMesh() {
   mesh = new Mesh({
     selfId: party.selfId,
@@ -696,12 +776,9 @@ function createMesh() {
       const m = party.members.find(x => x.id === id);
       const t = ensureTile(id, m ? m.name : 'Friend');
       if (t.video.srcObject !== stream) t.video.srcObject = stream;
-      t.video.play().catch(err => {
-        if (err.name === 'NotAllowedError') {
-          addSystem('Click anywhere in this panel to hear your friends.');
-          document.addEventListener('click', () => tiles.forEach(x => x.video.play().catch(() => {})), { once: true });
-        }
-      });
+      t.video.muted = false;
+      t.video.volume = 1;
+      playRemote(t);
       stream.getTracks().forEach(tr => { tr.onmute = tr.onunmute = () => refreshTileVideo(id); });
       watchLevel(id, stream);
       refreshTileVideo(id);

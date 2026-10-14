@@ -496,7 +496,7 @@ const sweeper = setInterval(() => {
 }, SWEEP_MS);
 
 if (require.main === module) {
-  server.listen(PORT, () => console.log(`CouchSync server listening on :${PORT}`));
+  server.listen(PORT, '0.0.0.0', () => console.log(`CouchSync server listening on :${PORT}`));
 }
 
 module.exports = { server, wss, rooms, close: () => { clearInterval(sweeper); wss.close(); server.close(); } };

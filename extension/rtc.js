@@ -21,7 +21,8 @@ export class Mesh {
   setIceServers(servers) { if (Array.isArray(servers) && servers.length) this.iceServers = servers; }
 
   localTrack(kind) {
-    return this.localStream ? this.localStream.getTracks().find(t => t.kind === kind && t.readyState === 'live') || null : null;
+    // A disabled (camera off / muted) track isn't sent at all, which saves bandwidth.
+    return this.localStream ? this.localStream.getTracks().find(t => t.kind === kind && t.readyState === 'live' && t.enabled) || null : null;
   }
 
   // Swap local camera/mic on every connection without renegotiating.

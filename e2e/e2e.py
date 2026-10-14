@@ -42,7 +42,7 @@ async def make_user(pw, name):
         d, executable_path=CHROME, headless=True, channel=None if CHROME else 'chromium',
         args=[f'--disable-extensions-except={EXT}', f'--load-extension={EXT}', '--headless=new',
               '--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream',
-              '--autoplay-policy=no-user-gesture-required'],
+              *([] if os.environ.get('REAL_AUTOPLAY') else ['--autoplay-policy=no-user-gesture-required'])],
         permissions=['camera', 'microphone'],
     )
     sw = ctx.service_workers[0] if ctx.service_workers else await ctx.wait_for_event('serviceworker')

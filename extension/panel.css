@@ -83,3 +83,5 @@ button.icon { background: transparent; border: 0; padding: 6px; font-size: 16px;
 .members { display: flex; flex-direction: column; gap: 6px; }
 .member { display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; background: var(--surface); border-radius: 8px; border: 1px solid var(--border); }
 .member .meta { color: var(--muted); font-size: 12px; }
+
+.sound-btn { margin: 8px 12px 0; flex: none; }
