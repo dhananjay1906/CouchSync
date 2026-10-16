@@ -34,17 +34,26 @@
       <div class="bar-actions">
         <button id="copy-link" class="small" title="Copy invite link">🔗 Invite</button>
         <button id="open-settings" class="icon" title="Settings">⚙️</button>
+        <button id="collapse" class="icon embed-only" title="Hide the panel — friends' faces float over the video">⇥</button>
       </div>
     </header>
 
     <div id="banner" class="banner hidden"><span id="banner-text"></span><button id="banner-action" class="small hidden"></button></div>
 
-    <div id="grid" class="grid"></div>
+    <div id="mini-bar" class="mini-bar">
+      <button id="mini-expand" class="ctl" title="Show the full panel (chat, settings)">⇤</button>
+      <button id="mini-mic" class="ctl" title="Mute / unmute">🎙️</button>
+      <button id="mini-cam" class="ctl" title="Camera on / off">📷</button>
+      <button id="mini-hide" class="ctl" title="Hide faces (the call keeps going)">✕</button>
+    </div>
+    <div id="grid" class="grid"><button id="show-hidden" class="small hidden"></button></div>
+    <button id="float-placeholder" class="float-placeholder hidden">⧉ Faces are floating over the movie — click to bring them back</button>
 
     <button id="enable-sound" class="primary sound-btn hidden">🔊 Click to hear your friends</button>
     <div class="media-controls">
       <button id="toggle-mic" class="ctl" title="Mute / unmute">🎙️</button>
       <button id="toggle-cam" class="ctl" title="Camera on / off">📷</button>
+      <button id="float" class="ctl" title="Float friends' faces over the movie (stays on top in fullscreen)">⧉</button>
       <button id="sync-me" class="ctl wide" title="Move everyone to where you are">⇆ Sync all to me</button>
     </div>
 
@@ -70,7 +79,7 @@
     <label class="check host-only-setting"><input type="checkbox" id="set-lock"> Lock party (no new people can join)</label>
     <label class="check"><input type="checkbox" id="set-hideip"> Hide my IP address from friends (video goes through the relay; needs a relay server)</label>
     <div id="members" class="members"></div>
-    <button id="rebind" class="small">Use the current tab for the party</button>
+    <button id="rebind" class="small not-embed">Use the current tab for the party</button>
     <button id="cam-permission" class="small">Fix camera / mic permission</button>
     <button id="copy-debug" class="small">Copy debug info (for troubleshooting)</button>
     <button id="leave" class="danger">Leave party</button>
@@ -81,6 +90,7 @@
       <video playsinline autoplay></video>
       <div class="avatar"></div>
       <div class="label"><span class="nm"></span><span class="icons"></span></div>
+      <button class="tile-hide" title="Hide this person's video (you still hear them)">✕</button>
     </div>
   </template>
 

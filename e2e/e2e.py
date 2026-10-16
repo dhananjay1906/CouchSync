@@ -36,7 +36,35 @@ async def wait_for(fn, timeout=10, interval=0.25):
         await asyncio.sleep(interval)
     return last if last else False
 
-async def make_user(pw, name):
+
+class SidebarPanel:
+    """The in-page sidebar (v1.3), driven like a page: every call goes to the current sidebar frame."""
+    def __init__(self, u): self.u = u; self._fr = None
+    async def frame(self, timeout=15):
+        w = self.u['watch']
+        async def f():
+            return next((fr for fr in w.frames if 'panel.html?embed=1' in fr.url and not fr.is_detached()), None)
+        fr = await wait_for(f, timeout)
+        if fr: self._fr = fr
+        return fr
+    async def open(self, mode='open'):
+        sw = self.u['ctx'].service_workers[0]
+        w = self.u['watch']
+        tid = await sw.evaluate("async (url) => (await chrome.tabs.query({})).find(t => t.url === url)?.id", w.url)
+        await sw.evaluate("async ([id, mode]) => toggleSidebar(await chrome.tabs.get(id), mode)", [tid, mode])
+        fr = await self.frame()
+        await wait_for(lambda: fr.evaluate("() => !!document.getElementById('create')"), 10)
+    async def reload(self):
+        await self.u['watch'].reload(); await asyncio.sleep(1)
+        await self.frame()
+    def locator(self, *a, **k): return self._fr.locator(*a, **k)
+    def __getattr__(self, name):
+        async def call(*a, **k):
+            fr = await self.frame()
+            return await getattr(fr, name)(*a, **k)
+        return call
+
+async def make_user(pw, name, embed=False):
     d = tempfile.mkdtemp(prefix=f'cs-{name}-')
     ctx = await pw.chromium.launch_persistent_context(
         d, executable_path=CHROME, headless=True, channel=None if CHROME else 'chromium',
@@ -50,6 +78,12 @@ async def make_user(pw, name):
     watch = await ctx.new_page()
     await watch.goto(f'{SITE}/watch1.html')
     await asyncio.sleep(1.5)
+    if embed:
+        await sw.evaluate(f"chrome.storage.local.set({{serverUrl: '{SERVER}'}})")
+        u = dict(ctx=ctx, watch=watch, ext=ext_id, name=name, dir=d)
+        u['panel'] = SidebarPanel(u)
+        await u['panel'].open()
+        return u
     panel = await ctx.new_page()
     await panel.goto(f'chrome-extension://{ext_id}/panel.html?autoMedia=1')
     tab_id = await panel.evaluate("""async () => (await chrome.tabs.query({})).find(t => t.url.includes('/watch')).id""")

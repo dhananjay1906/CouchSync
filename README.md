@@ -1,11 +1,11 @@
 # CouchSync 🛋️
 
-Free watch parties for up to **4 people**: playback stays in sync, everyone's **live camera + mic** sit in a side panel next to the movie, plus chat and emoji reactions. No subscriptions. You run your own tiny server.
+Free watch parties for up to **4 people**: playback stays in sync, everyone's **live camera + mic** sit in a sidebar right inside the video page (like Teleparty), plus chat and emoji reactions. No subscriptions. You run your own tiny server.
 
 Everyone needs their **own** account for the streaming service. CouchSync never streams the movie itself; it only syncs play/pause/position.
 
 ```
-extension/   Chrome extension (side panel: faces, chat, sync)
+extension/   Chrome extension (in-page sidebar: faces, chat, sync)
 server/      Node server: rooms, sync, chat, video-call signaling
 e2e/         Automated browser tests (2-person, 4-person, invite link)
 render.yaml  One-click free hosting on Render
@@ -23,7 +23,7 @@ npm start            # → CouchSync server listening on :8787
 
 1. Open `chrome://extensions`, turn on **Developer mode**, click **Load unpacked**, pick the `extension` folder.
 2. Pin CouchSync (puzzle icon → pin).
-3. Open any video (e.g. YouTube), click the CouchSync icon → side panel opens → enter your name → **Start a party in this tab**.
+3. Open any video (e.g. YouTube), click the CouchSync icon → the sidebar opens on the right of the page → enter your name → **Start a party in this tab**.
 4. Test with a second Chrome profile on the same computer: load the extension there too and paste the invite link.
 
 `localhost` only works on your machine. To use it with friends, do step 2.
@@ -59,13 +59,25 @@ Each friend: unzip → `chrome://extensions` → Developer mode → **Load unpac
 ## 4. Using it
 1. **Host**: open the movie or episode, click the CouchSync icon → **Start a party** → **🔗 Invite** copies the link → send it.
 2. **Friends**: open the link → **Join party** → the movie opens → click the CouchSync icon. The panel joins and syncs automatically.
-3. Click 📷 once to allow camera/mic. Chrome can't prompt inside a side panel, so a one-time tab opens for that.
+3. Click 📷 to allow camera/mic. The browser asks once per website (say Allow / "Always allow").
 4. Anyone can play/pause/seek with the site's normal controls, and everyone follows. The host can lock controls in ⚙️ Settings.
-5. **Use F11 (browser fullscreen), not the player's fullscreen button.** Player fullscreen covers the side panel, which hides faces and chat.
+5. **The player's fullscreen button works:** the movie fills the screen and the sidebar stays on the right. (A few players live inside a separate embedded frame — then fullscreen covers the sidebar; collapse it to floating faces or use F11.)
 
 **Headphones are strongly recommended.** Otherwise your mic picks up the movie and friends hear it twice. Chrome's echo cancellation helps but can't fully remove it. "Lower movie volume while friends talk" (on by default) also helps.
 
 ---
+
+## Which browsers
+- **Chrome, Edge, Brave, Opera** (any Chromium browser): the sidebar lives inside the web page itself, so it looks and works the same everywhere. No extra window.
+- **Firefox and Safari: not supported.** They use different extension systems; that would be a separate port.
+
+## The sidebar: open, floating faces, hidden
+- **Toolbar icon** opens/closes the sidebar on the current tab. It works on any page with an HTML5 video — big streaming sites and small/personal sites alike (plain http too).
+- **|→** (top of the sidebar) collapses it: the movie goes full width and friends' faces float in a small box you can drag anywhere. The box has ⇤ (back to the sidebar), 🎙️, 📷 and ✕ (hide the faces).
+- **✕ / hidden:** nothing on screen except a small orange "CouchSync" tab on the right edge; the call and sync keep going. Click the tab or the toolbar icon to bring it back.
+- Hover a face → **hide** just that person. "Show hidden" brings them back.
+- **⧉** pops the faces into an always-on-top picture-in-picture window, if you want them outside the browser.
+- Reloading the page or clicking to the next episode reopens the sidebar by itself, still in the party.
 
 ## Settings (⚙️ in the panel)
 - **Only I (host) can play / pause / seek** — guests' changes are undone and they're told why.
@@ -87,7 +99,7 @@ Each friend: unzip → `chrome://extensions` → Developer mode → **Load unpac
 | Different editions/regions (lengths differ) | Friends are warned that scenes won't line up. |
 | Host-only mode | Guests snap back instantly instead of drifting. |
 | Party open in two windows | The old window stops and offers "Use it here" — no reconnect loop. |
-| Side panel closed | The video page shows "you're no longer synced" with a Reopen button. |
+| Sidebar hidden or page reloaded | Call and sync keep running while hidden; after a reload it reopens and rejoins by itself. |
 | Player fullscreen hides the panel | A one-time hint explains Esc → F11. |
 | Netflix changes its internal player | Detected and shown; play/pause still sync, use ⇆ if someone drifts. |
 | Old extension versions | Friends on old versions are flagged; the server warns outdated clients. |
@@ -116,7 +128,7 @@ Each friend: unzip → `chrome://extensions` → Developer mode → **Load unpac
 ## Still not solved (needs money, a store listing, or a different design)
 - **Video calls on blocked networks need a relay account** (Cloudflare/ExpressTURN signup).
 - **Updates are manual** until it's on the Chrome Web Store ($5 one-time + review; see PRIVACY.md and the checklist below). Chrome also shows a developer-mode warning for unpacked extensions.
-- **Closing the side panel still stops syncing** (you get a notice and a Reopen button, but the sync lives in the panel).
+- **Closing the tab ends your part of the party** (the sidebar lives in the page). Reopen the invite link to come back.
 - **Fullscreen hides the panel** — use F11.
 - **Not tested on the real Netflix/Prime/Hulu/Disney+/Max players** — only on test pages that imitate them. Expect small fixes.
 - **Ad-stitched streams** (some Prime/Hulu ad plans) can still drift; ad-free plans sync best.
@@ -126,7 +138,7 @@ Each friend: unzip → `chrome://extensions` → Developer mode → **Load unpac
 ### Chrome Web Store checklist (if you publish)
 1. Pick a name/logo that doesn't use any streaming service's or Teleparty's trademarks.
 2. Host PRIVACY.md somewhere public and link it.
-3. Justify permissions: "all sites" (to find the video player on any streaming site), tabs, side panel, storage, scripting.
+3. Justify permissions: "all sites" (to find the video player on any streaming site), tabs, storage, scripting.
 4. $5 developer registration, upload the zipped `extension` folder, wait for review.
 
 ## Tests
@@ -135,6 +147,9 @@ cd server && npm test          # 17 server tests: sync, holds, ads, reconnects, 
 cd e2e && python3 e2e.py       # 2 people in real Chrome: sync, chat, video, episode switch, server restart
 python3 e2e4.py                # 4 people: all in sync, everyone sees 3 faces, 5th rejected
 python3 e2e_join.py            # invite-link flow
+python3 e2e_embed.py           # in-page sidebar: invite, sync, collapse/float, hide, fullscreen, reload
+python3 e2e_float.py           # floating faces window, hiding a person
+python3 e2e_invite.py          # invite joins the right party on the first click
 python3 e2e_v11.py             # media keys, still-watching, host-only, two windows, kick/lock, idle tabs, episodes
 PAGE=yt2.html python3 e2e_rejoin.py  # rejoin with YouTube-like player quirks (no rewinds)
 ```

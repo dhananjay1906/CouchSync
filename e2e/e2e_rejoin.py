@@ -17,13 +17,13 @@ async def main():
     await asyncio.sleep(1)
     try:
         async with async_playwright() as pw:
-            a = await make_user(pw, 'Asha'); b = await make_user(pw, 'Ben')
+            a = await make_user(pw, 'Asha', embed=True); b = await make_user(pw, 'Ben', embed=True)
             for u in (a, b):
                 await u['watch'].goto(f'{SITE}/{PAGE}'); await asyncio.sleep(1)
-                await u['panel'].reload()
+                await u['panel'].open()
             await a['panel'].fill('#name', 'Asha'); await a['panel'].click('#create')
             room = re.search(r'Party (\w+)', await wait_for(lambda: a['panel'].text_content('#room-label'))).group(1)
-            await a['watch'].mouse.click(1100, 650)  # a real person clicks first
+            await a['watch'].mouse.click(300, 650)  # a real person clicks first
             await a['watch'].evaluate("() => { const v = document.querySelector('video'); v.currentTime = 60; v.play().catch(()=>{}); }")
             await asyncio.sleep(2)
             await b['panel'].fill('#name', 'Ben'); await b['panel'].fill('#join-code', f'{SERVER}/j/{room}'); await b['panel'].click('#join')
@@ -39,9 +39,6 @@ async def main():
             await b['watch'].goto(f'{SERVER}/j/{room}')
             await wait_for(lambda: b['watch'].is_visible('#join'), 5)
             await b['watch'].click('#join')
-            await wait_for(lambda: b['panel'].input_value('#join-code'), 3)
-            if await b['panel'].is_visible('#join'):
-                await b['panel'].click('#join')
             # localhost isn't a known streaming site, so the friend clicks "Open it" in the panel
             if await wait_for(lambda: b['panel'].evaluate("() => document.getElementById('banner-text').textContent.includes('localhost')"), 8) is True:
                 await b['panel'].click('#banner-action')

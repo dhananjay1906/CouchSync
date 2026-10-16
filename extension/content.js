@@ -376,11 +376,11 @@
   function hideToast() { clearTimeout(toastTimer); if (toastEl) { toastEl.remove(); toastEl = null; } }
 
   // Player fullscreen covers the side panel (friends + chat). Explain the alternative once.
-  let fsHintShown = false;
+  let fsHintShown = false, floating = false;
   document.addEventListener('fullscreenchange', () => {
-    if (!document.fullscreenElement || !active || fsHintShown) return;
+    if (!document.fullscreenElement || !active || fsHintShown || floating) return;
     fsHintShown = true;
-    toast('Fullscreen hides your friends and chat. Press Esc, then F11 (or ⌃⌘F on Mac) for full-screen with the panel.', null, null, 9000);
+    toast('Fullscreen hides the CouchSync panel. Click ⧉ in the panel to float your friends\' faces on top of the movie.', null, null, 9000);
   });
 
   // The panel does the syncing. If it's closed, say so instead of silently drifting.
@@ -437,6 +437,163 @@
     chrome.runtime.sendMessage(status).catch(() => {});
   }
 
+  // ---------- in-page sidebar (top frame only), like Teleparty ----------
+  // The CouchSync panel is an extension page shown in an iframe on the right of the page. Modes:
+  //   open   – sidebar on the right; the page shrinks to make room
+  //   mini   – friends' faces float over the video in a small box you can drag
+  //   hidden – only a small "CouchSync" tab on the right edge (the call keeps running)
+  const SIDEBAR_W = 360;
+  let sb = null;
+  let pageStyle = null;
+
+  function ensurePageStyle() {
+    if (pageStyle && pageStyle.isConnected) return;
+    pageStyle = document.createElement('style');
+    pageStyle.id = 'couchsync-page-style';
+    pageStyle.textContent = `
+      html[data-couchsync-open="open"] { --couchsync-w: ${SIDEBAR_W}px; }
+      html[data-couchsync-open="open"]:not([data-couchsync-fs]) body {
+        width: calc(100% - ${SIDEBAR_W}px) !important; min-width: 0 !important; max-width: none !important;
+        transform: translateZ(0) !important; /* keeps the site's fixed-position player inside the shrunk area */
+      }
+      html[data-couchsync-fs] body { transform: none !important; }
+      html[data-couchsync-fs] .couchsync-fs-target {
+        position: fixed !important; top: 0 !important; left: 0 !important; right: auto !important; bottom: auto !important;
+        width: calc(100vw - var(--couchsync-w, 0px)) !important; height: 100vh !important;
+        max-width: none !important; max-height: none !important; min-width: 0 !important;
+        margin: 0 !important; transform: none !important; z-index: 2147483646 !important; background: #000 !important;
+      }`;
+    (document.head || document.documentElement).appendChild(pageStyle);
+  }
+
+  async function whoAmI() {
+    try { const r = await chrome.runtime.sendMessage({ bg: 'whoami' }); return r && r.tabId; } catch { return null; }
+  }
+
+  async function createSidebar() {
+    if (sb) return sb;
+    const tabId = await whoAmI();
+    if (tabId == null || sb) return sb;
+    ensurePageStyle();
+    const token = [...crypto.getRandomValues(new Uint8Array(16))].map(b => b.toString(16).padStart(2, '0')).join(''); // randomUUID needs https; plain-http sites must work too
+    const host = document.createElement('couchsync-sidebar');
+    host.style.cssText = 'all: initial; position: fixed; z-index: 2147483647; top: 0; right: 0; width: 0; height: 0;';
+    const sr = host.attachShadow({ mode: 'closed' });
+    sr.innerHTML = `<style>
+      :host { all: initial; }
+      .box { position: fixed; z-index: 2147483647; display: flex; flex-direction: column; background: #0f1115; box-shadow: -2px 0 16px rgba(0,0,0,.45); overflow: hidden; }
+      .box.open { top: 0; right: 0; width: ${SIDEBAR_W}px; height: 100vh; }
+      .box.mini { width: 280px; height: 230px; border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,.55); }
+      .box.hidden { width: 1px; height: 1px; opacity: 0; pointer-events: none; right: 0; bottom: 0; }
+      .drag { display: none; height: 32px; cursor: move; background: #1b1e26; flex: none; align-items: center; padding: 0 6px; gap: 4px; }
+      .drag .grip { flex: 1; height: 100%; display: flex; align-items: center; justify-content: center; }
+      .drag .grip::before { content: ''; width: 36px; height: 4px; border-radius: 2px; background: #555b6a; }
+      .drag button { all: initial; width: 30px; height: 24px; border-radius: 6px; background: #2a2f3b; color: #fff; font: 14px system-ui, sans-serif;
+                     display: flex; align-items: center; justify-content: center; cursor: pointer; }
+      .drag button:hover { background: #3a4152; }
+      .drag button.off { background: #ff5470; }
+      .box.mini .drag { display: flex; }
+      iframe { border: 0; width: 100%; flex: 1; min-height: 0; background: #0f1115; color-scheme: dark; }
+      .tab { position: fixed; z-index: 2147483647; right: 0; top: 45%; display: none; writing-mode: vertical-rl; transform: rotate(180deg);
+             background: #ff6b4a; color: #fff; font: 600 13px system-ui, sans-serif; padding: 12px 7px; border-radius: 0 8px 8px 0;
+             cursor: pointer; box-shadow: 0 4px 16px rgba(0,0,0,.4); border: 0; }
+      .tab.show { display: block; }
+    </style>
+    <div class="box open"><div class="drag" title="Drag to move">
+      <button data-a="expand" title="Show the full panel">⇤</button><button data-a="mic" title="Mute / unmute">🎙️</button><button data-a="cam" title="Camera on / off">📷</button><button data-a="hide" title="Hide faces (the call keeps going)">✕</button><span class="grip"></span>
+    </div></div>
+    <button class="tab" title="Show CouchSync">🛋 CouchSync</button>`;
+    const box = sr.querySelector('.box');
+    const frame = document.createElement('iframe');
+    frame.allow = 'camera *; microphone *; autoplay *; clipboard-write *; picture-in-picture *; display-capture *';
+    frame.src = chrome.runtime.getURL(`panel.html?embed=1&tabId=${tabId}#${token}`);
+    box.append(frame);
+    const tab = sr.querySelector('.tab');
+    tab.addEventListener('click', () => setSidebarMode('open', true));
+    // Drag the floating faces box.
+    const drag = sr.querySelector('.drag');
+    // The floating box's buttons live here, in the page, so they always get your clicks.
+    drag.querySelectorAll('button').forEach(b => {
+      b.addEventListener('pointerdown', e => e.stopPropagation());
+      b.addEventListener('click', e => {
+        e.stopPropagation();
+        const a = b.dataset.a;
+        if (a === 'expand') setSidebarMode('open', true);
+        else if (a === 'hide') setSidebarMode('hidden', true);
+        else chrome.runtime.sendMessage({ panel: 'mini-action', action: a }).catch(() => {});
+      });
+    });
+    drag.addEventListener('pointerdown', e => {
+      e.preventDefault();
+      const r = box.getBoundingClientRect();
+      const dx = e.clientX - r.left, dy = e.clientY - r.top;
+      frame.style.pointerEvents = 'none';
+      const move = ev => {
+        const x = Math.min(Math.max(0, ev.clientX - dx), innerWidth - r.width);
+        const y = Math.min(Math.max(0, ev.clientY - dy), innerHeight - r.height);
+        box.style.left = x + 'px'; box.style.top = y + 'px'; box.style.right = 'auto'; box.style.bottom = 'auto';
+      };
+      const up = () => { frame.style.pointerEvents = ''; removeEventListener('pointermove', move, true); removeEventListener('pointerup', up, true); };
+      addEventListener('pointermove', move, true);
+      addEventListener('pointerup', up, true);
+    });
+    document.documentElement.appendChild(host); // on <html>, not <body>, so the body shrink doesn't move it
+    sb = { host, box, frame, tab, token, tabId, mode: null, miniHeight: 230 };
+    // Sites that rebuild the whole page (some SPAs) can remove us; put the sidebar back.
+    new MutationObserver(() => { if (sb && !sb.host.isConnected) document.documentElement.appendChild(sb.host); })
+      .observe(document.documentElement, { childList: true });
+    return sb;
+  }
+
+  function setSidebarMode(mode, fromUser) {
+    if (!sb) return;
+    sb.mode = mode;
+    sb.box.className = 'box ' + mode;
+    if (mode === 'mini') {
+      sb.box.style.height = sb.miniHeight + 'px';
+      if (!sb.box.style.left) { sb.box.style.right = '16px'; sb.box.style.bottom = '84px'; sb.box.style.top = 'auto'; }
+    } else {
+      sb.box.style.cssText = '';
+    }
+    sb.tab.classList.toggle('show', mode === 'hidden');
+    if (mode === 'open') document.documentElement.setAttribute('data-couchsync-open', 'open');
+    else document.documentElement.setAttribute('data-couchsync-open', mode);
+    // The panel adapts its layout (full / faces only).
+    chrome.runtime.sendMessage({ panel: 'sidebar-mode', mode }).catch(() => {});
+    if (fromUser) chrome.runtime.sendMessage({ bg: 'remember-mode', mode }).catch(() => {});
+    // Video sites relayout on resize events.
+    setTimeout(() => dispatchEvent(new Event('resize')), 50);
+  }
+
+  function removeSidebar() {
+    if (!sb) return;
+    sb.host.remove();
+    document.documentElement.removeAttribute('data-couchsync-open');
+    sb = null;
+    setTimeout(() => dispatchEvent(new Event('resize')), 50);
+  }
+
+  async function sidebarCmd(mode) {
+    if (!IS_TOP) return;
+    if (!sb) {
+      await createSidebar();
+      setSidebarMode(mode === 'toggle' ? 'open' : mode, true);
+      return;
+    }
+    if (mode === 'toggle') setSidebarMode(sb.mode === 'open' ? 'hidden' : 'open', true);
+    else setSidebarMode(mode, true);
+  }
+
+  // Reopen by itself after a page load if you're in a party in this tab, or an invite is waiting.
+  if (IS_TOP && /^https?:$/.test(location.protocol)) {
+    setTimeout(async () => {
+      try {
+        const r = await chrome.runtime.sendMessage({ bg: 'should-open' });
+        if (r && r.open && !sb) { await createSidebar(); setSidebarMode(r.mode || 'open', false); }
+      } catch {}
+    }, 300);
+  }
+
   // ---------- panel → content ----------
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (!msg || !msg.cs) return;
@@ -470,6 +627,15 @@
         applyTarget(!!msg.force);
         break;
       case 'duck': if (active) setDuck(!!msg.on); break;
+      case 'pip': floating = !!msg.on; break;
+      case 'sidebar-cmd': if (IS_TOP) sidebarCmd(msg.mode || 'toggle'); break;
+      case 'sidebar-mode': if (IS_TOP && sb) { if (msg.height) sb.miniHeight = msg.height; setSidebarMode(msg.mode, true); } break;
+      case 'sidebar-close': if (IS_TOP) removeSidebar(); break;
+      case 'mini-state': if (IS_TOP && sb) {
+        const q = a => sb.box.querySelector(`.drag button[data-a="${a}"]`);
+        q('mic').textContent = msg.mic ? '🎙️' : '🔇'; q('mic').classList.toggle('off', !msg.mic); q('cam').classList.toggle('off', !msg.cam);
+      } break;
+      case 'verify-embed': if (IS_TOP) { sendResponse({ ok: !!(sb && msg.token === sb.token), mode: sb && sb.mode }); return; } break;
       case 'status': report(true); break;
       case 'deactivate-all': active = false; target = null; lastWake = 0; setDuck(false); hideBlocked(); cancelPending(); break;
     }
