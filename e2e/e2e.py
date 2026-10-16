@@ -42,7 +42,7 @@ async def make_user(pw, name):
         d, executable_path=CHROME, headless=True, channel=None if CHROME else 'chromium',
         args=[f'--disable-extensions-except={EXT}', f'--load-extension={EXT}', '--headless=new',
               '--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream',
-              *([] if os.environ.get('REAL_AUTOPLAY') else ['--autoplay-policy=no-user-gesture-required'])],
+              *([] if os.environ.get('REAL_AUTOPLAY') else ['--autoplay-policy=no-user-gesture-required']), *[x for x in os.environ.get('EXTRA_CHROME_ARGS', '').split('|') if x]],
         permissions=['camera', 'microphone'],
     )
     sw = ctx.service_workers[0] if ctx.service_workers else await ctx.wait_for_event('serviceworker')
@@ -80,6 +80,7 @@ async def main():
             room = room.group(1)
 
             # host starts the movie at ~10s
+            await a['watch'].mouse.click(1100, 650)  # a real person clicks first
             await a['watch'].evaluate("() => { const v = document.querySelector('video'); v.currentTime = 10; return v.play(); }")
             await asyncio.sleep(3)
 
@@ -96,14 +97,17 @@ async def main():
             check('guest joins mid-movie and catches up (<1s apart)', ok is True, f"A={sa['t']:.2f} B={sb['t']:.2f} Bpaused={sb['paused']}")
 
             # --- pause on host → guest pauses
+            await a['watch'].mouse.click(1100, 650)  # a real person clicks first
             await a['watch'].evaluate("() => document.querySelector('video').pause()")
             ok = await wait_for(lambda: _paused(b), 5)
             sa, sb = await vstate(a), await vstate(b)
             check('host pause pauses guest', ok is True and abs(sa['t'] - sb['t']) < 0.7, f"A={sa['t']:.2f} B={sb['t']:.2f}")
 
             # --- guest seeks + plays → host follows
+            await b['watch'].mouse.click(1100, 650)  # a real person clicks first
             await b['watch'].evaluate("() => { const v = document.querySelector('video'); v.currentTime = 120; }")
             await asyncio.sleep(1)
+            await b['watch'].mouse.click(1100, 650)  # a real person clicks first
             await b['watch'].evaluate("() => document.querySelector('video').play()")
             async def a_follow():
                 sa, sb = await vstate(a), await vstate(b)
@@ -148,6 +152,7 @@ async def main():
             # --- host switches episode → guest auto-follows and syncs
             await a['watch'].goto(f'{SITE}/watch2.html')
             await asyncio.sleep(1.5)
+            await a['watch'].mouse.click(1100, 650)  # a real person clicks first
             await a['watch'].evaluate("() => { const v = document.querySelector('video'); v.currentTime = 30; v.play().catch(() => {}); }")
             async def ep2():
                 sa, sb = await vstate(a), await vstate(b)
@@ -163,6 +168,7 @@ async def main():
             ok = await wait_for(lambda: a['panel'].evaluate("() => document.getElementById('conn-dot').classList.contains('ok')"), 25)
             ok2 = await wait_for(lambda: b['panel'].evaluate("() => document.getElementById('conn-dot').classList.contains('ok')"), 25)
             check('both reconnect after server restart', ok is True and ok2 is True)
+            await a['watch'].mouse.click(1100, 650)  # a real person clicks first
             await a['watch'].evaluate("() => document.querySelector('video').pause()")
             ok = await wait_for(lambda: _paused(b), 8)
             if ok is not True:

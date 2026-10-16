@@ -1,0 +1,13 @@
+<!doctype html><title>YT-like Movie 2</title>
+<body style="margin:0;background:#000"><video id="v" src="movie.webm" style="width:960px;height:540px" autoplay muted></video>
+<script>
+// Real-player quirks: autoplay from 0, then (late) jump back to "where you left off",
+// and a brief internal pause/play blip like players do around quality switches.
+const v = document.getElementById('v');
+const saved = +localStorage.getItem('pos') || 0;
+v.addEventListener('loadedmetadata', () => {
+  if (saved > 5) setTimeout(() => { v.currentTime = saved; }, 3000);
+  setTimeout(() => { v.pause(); setTimeout(() => v.play(), 300); }, 5000);
+}, { once: true });
+setInterval(() => localStorage.setItem('pos', v.currentTime), 1000);
+</script></body>

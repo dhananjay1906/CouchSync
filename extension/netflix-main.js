@@ -18,11 +18,13 @@
   window.addEventListener('message', e => {
     if (e.source !== window || !e.data || e.data.source !== 'couchsync-cs') return;
     const p = getPlayer();
-    if (!p) return;
+    const ack = ok => window.postMessage({ source: 'couchsync-nf', ok }, '*');
+    if (!p) return ack(false); // Netflix changed its player: the content script reports it
     try {
       if (e.data.cmd === 'seek' && Number.isFinite(e.data.ms)) p.seek(e.data.ms);
       else if (e.data.cmd === 'play') p.play();
       else if (e.data.cmd === 'pause') p.pause();
-    } catch { /* player not ready yet; the content script will retry on its next drift check */ }
+      ack(true);
+    } catch { ack(false); }
   });
 })();

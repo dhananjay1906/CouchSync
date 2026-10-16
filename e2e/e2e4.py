@@ -16,6 +16,7 @@ async def main():
             await host['panel'].click('#create')
             label = await wait_for(lambda: host['panel'].text_content('#room-label'))
             room = re.search(r'Party (\w+)', label).group(1)
+            await host['watch'].mouse.click(1100, 650)  # a real person clicks first
             await host['watch'].evaluate("() => { const v = document.querySelector('video'); v.currentTime = 50; v.play().catch(()=>{}); }")
             await asyncio.sleep(2)
             for u in users[1:]:
@@ -38,6 +39,7 @@ async def main():
             counts = [await faces(u) for u in users]
             check('everyone sees all 3 friends live', ok is True, str(counts))
 
+            await users[2]['watch'].mouse.click(1100, 650)  # a real person clicks first
             await users[2]['watch'].evaluate("() => document.querySelector('video').pause()")
             async def all_paused():
                 return all([(await vstate(u))['paused'] for u in users])

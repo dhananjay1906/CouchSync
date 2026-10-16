@@ -11,6 +11,7 @@ async def main():
             a = await make_user(pw, 'Asha')
             await a['panel'].fill('#name', 'Asha'); await a['panel'].click('#create')
             room = re.search(r'Party (\w+)', await wait_for(lambda: a['panel'].text_content('#room-label'))).group(1)
+            await a['watch'].mouse.click(1100, 650)  # a real person clicks first
             await a['watch'].evaluate("() => { const v = document.querySelector('video'); v.currentTime = 20; v.play().catch(()=>{}); }")
             await asyncio.sleep(2.5)
             b = await make_user(pw, 'Ben')
@@ -21,11 +22,19 @@ async def main():
             info = await page.text_content('#info')
             check('invite page shows what is playing', 'Test Movie' in info, info)
             await page.click('#join')
-            ok = await wait_for(lambda: page.evaluate("() => location.pathname === '/watch1.html'"), 8)
-            check('clicking Join opens the host\'s video', ok is True)
+            # localhost isn't a known streaming site, so the page must NOT be opened automatically...
+            await asyncio.sleep(2)
+            auto = await page.evaluate("() => location.pathname === '/watch1.html'")
+            check('unknown sites are not opened automatically from an invite', auto is False)
             code = await wait_for(lambda: b['panel'].input_value('#join-code'), 5)
             check('open panel picks up the invite (asks for name first)', room in (code or ''), str(code))
             await b['panel'].fill('#name', 'Ben'); await b['panel'].click('#join')
+            # ...the panel offers it instead, showing where it goes
+            btxt = await wait_for(lambda: b['panel'].evaluate("() => !document.getElementById('banner').classList.contains('hidden') && document.getElementById('banner-text').textContent.includes('localhost') && document.getElementById('banner-text').textContent"), 10)
+            check('panel offers the host video with its site name', isinstance(btxt, str) and 'localhost' in btxt, str(btxt))
+            await b['panel'].click('#banner-action')
+            ok = await wait_for(lambda: b['watch'].evaluate("() => location.pathname === '/watch1.html'"), 8)
+            check("one click opens the host's video", ok is True)
             async def synced():
                 sa, sb = await vstate(a), await vstate(b)
                 return not sb['paused'] and abs(sa['t'] - sb['t']) < 1

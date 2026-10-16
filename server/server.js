@@ -13,6 +13,13 @@ const MAX_MEMBERS = Number(process.env.MAX_MEMBERS) || 4;
 const RECONNECT_GRACE_MS = Number(process.env.RECONNECT_GRACE_MS) || 30_000;
 const EMPTY_ROOM_TTL_MS = Number(process.env.EMPTY_ROOM_TTL_MS) || 10 * 60_000;
 const BUFFER_WAIT_LIMIT_MS = Number(process.env.BUFFER_WAIT_LIMIT_MS) || 20_000;
+const AD_WAIT_LIMIT_MS = Number(process.env.AD_WAIT_LIMIT_MS) || 3 * 60_000;
+const MAX_ROOMS = Number(process.env.MAX_ROOMS) || 5000;
+const MAX_CONN_PER_IP = Number(process.env.MAX_CONN_PER_IP) || 30;
+const MAX_ROOMS_PER_IP_PER_10MIN = Number(process.env.MAX_ROOMS_PER_IP_PER_10MIN) || 10;
+const CHAT_HISTORY = 50;
+const SERVER_VERSION = require('./package.json').version;
+const MIN_CLIENT_VERSION = process.env.MIN_CLIENT_VERSION || '1.1.0';
 const HEARTBEAT_MS = 15_000;
 const MAX_MSG_BYTES = 64 * 1024;
 
@@ -30,6 +37,10 @@ function newRoomId() {
   return id;
 }
 const isRoomId = s => typeof s === 'string' && /^[a-z0-9]{4,32}$/.test(s);
+const newPublicId = () => crypto.randomBytes(9).toString('base64url');
+const vnum = v => String(v || '0').split('.').map(x => parseInt(x, 10) || 0);
+const versionLess = (a, b) => { const x = vnum(a), y = vnum(b); for (let i = 0; i < 3; i++) { if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) < (y[i] || 0); } return false; };
+const log = (...a) => console.log(new Date().toISOString(), ...a);
 const isClientId = s => typeof s === 'string' && /^[A-Za-z0-9_-]{8,64}$/.test(s);
 const clampStr = (s, n) => (typeof s === 'string' ? s.replace(/[\u0000-\u001f]/g, ' ').trim().slice(0, n) : '');
 const finite = (n, lo, hi) => typeof n === 'number' && Number.isFinite(n) && n >= lo && n <= hi;
@@ -44,7 +55,11 @@ function send(ws, msg) {
 function createRoom(id) {
   const room = {
     id,
-    members: new Map(), // clientId -> member
+    members: new Map(), // public id -> member (public ids are safe to share)
+    bySecret: new Map(), // secret client id -> member (never sent to anyone else)
+    banned: new Set(), // secret ids the host removed
+    locked: false,
+    chat: [],
     hostId: null,
     hostOnly: false,
     media: null, // { url, key, title, duration }
@@ -57,6 +72,7 @@ function createRoom(id) {
     mediaChangedAt: 0,
   };
   rooms.set(id, room);
+  log('room created', id, 'rooms:', rooms.size);
   return room;
 }
 
@@ -72,6 +88,7 @@ function connectedMembers(room) {
 function publicMembers(room) {
   return [...room.members.values()].map(m => ({
     id: m.id, name: m.name, connected: !!m.ws, buffering: !!m.buffering, ad: !!m.ad, ready: !!m.hasVideo,
+    duration: m.duration || 0, label: m.label || '', version: m.version || '',
   }));
 }
 
@@ -80,7 +97,7 @@ function broadcast(room, msg, exceptId) {
 }
 
 function broadcastMembers(room) {
-  broadcast(room, { type: 'members', members: publicMembers(room), hostId: room.hostId, hostOnly: room.hostOnly });
+  broadcast(room, { type: 'members', members: publicMembers(room), hostId: room.hostId, hostOnly: room.hostOnly, locked: room.locked });
 }
 
 function broadcastState(room, by, reason) {
@@ -96,7 +113,8 @@ function system(room, text) {
 function holders(room) {
   const t = now();
   return connectedMembers(room).filter(m => {
-    if (m.ad) return true;
+    // An ad holds everyone, but never forever (stuck ad detection must not freeze the party).
+    if (m.ad) return t - (m.adSince || t) < AD_WAIT_LIMIT_MS;
     // After the host switches episode/movie, wait for friends' tabs to load it.
     if (room.media && m.id !== room.hostId && m.key !== room.media.key && t - room.mediaChangedAt < BUFFER_WAIT_LIMIT_MS) return true;
     if (m.buffering) return t - m.bufferingSince < BUFFER_WAIT_LIMIT_MS;
@@ -140,6 +158,7 @@ function removeMember(room, id) {
   if (!m) return;
   clearTimeout(m.graceTimer);
   room.members.delete(id);
+  room.bySecret.delete(m.secret);
   broadcast(room, { type: 'peer-leave', id });
   system(room, `${m.name} left`);
   if (room.hostId === id) {
@@ -158,23 +177,31 @@ function handleHello(ws, msg) {
   const name = clampStr(msg.name, 24) || 'Guest';
   let room;
   if (msg.create) {
+    if (rooms.size >= MAX_ROOMS) return send(ws, { type: 'error', code: 'busy', message: 'The server is at capacity right now. Try again in a few minutes.' });
+    const t = now();
+    const ipLog = (roomsByIp.get(ws.ip) || []).filter(x => t - x < 10 * 60_000);
+    if (ipLog.length >= MAX_ROOMS_PER_IP_PER_10MIN) return send(ws, { type: 'error', code: 'rate', message: 'Too many parties started from your network. Wait a few minutes.' });
+    ipLog.push(t); roomsByIp.set(ws.ip, ipLog);
     room = createRoom(newRoomId());
   } else {
     if (!isRoomId(msg.room)) return send(ws, { type: 'error', code: 'bad_room', message: 'That party code is not valid.' });
     room = rooms.get(msg.room);
     // A client that was already in this room (e.g. the server restarted) may bring it back with the same code.
-    if (!room && msg.resurrect) { room = createRoom(msg.room); room.resurrected = true; }
+    if (!room && msg.resurrect && rooms.size < MAX_ROOMS) { room = createRoom(msg.room); room.resurrected = true; }
     if (!room) return send(ws, { type: 'error', code: 'not_found', message: 'Party not found. It may have ended — ask the host for a new link.' });
   }
 
-  let member = room.members.get(msg.clientId);
+  if (room.banned.has(msg.clientId)) return send(ws, { type: 'error', code: 'kicked', message: 'The host removed you from this party.' });
+  let member = room.bySecret.get(msg.clientId);
   const rejoin = !!member;
   if (!member) {
+    if (room.locked) return send(ws, { type: 'error', code: 'locked', message: 'The host locked this party. Ask them to unlock it.' });
     if (room.members.size >= MAX_MEMBERS) {
       return send(ws, { type: 'error', code: 'full', message: `This party is full (max ${MAX_MEMBERS}).` });
     }
-    member = { id: msg.clientId, name, joinedAt: now(), ws: null, buffering: false, bufferingSince: 0, ad: false, hasVideo: false };
+    member = { id: newPublicId(), secret: msg.clientId, name, joinedAt: now(), ws: null, buffering: false, bufferingSince: 0, ad: false, hasVideo: false };
     room.members.set(member.id, member);
+    room.bySecret.set(member.secret, member);
   } else {
     clearTimeout(member.graceTimer);
     if (member.ws && member.ws !== ws) { member.ws.member = null; try { member.ws.close(4000, 'replaced'); } catch {} }
@@ -183,6 +210,7 @@ function handleHello(ws, msg) {
   member.ws = ws;
   member.buffering = false;
   member.ad = false;
+  member.version = clampStr(msg.version, 16);
   ws.member = member;
   ws.room = room;
   room.emptySince = null;
@@ -202,6 +230,11 @@ function handleHello(ws, msg) {
     serverTime: now(),
     rejoin,
     resurrected: !!room.resurrected && room.members.size === 1,
+    locked: room.locked,
+    chat: room.chat,
+    serverVersion: SERVER_VERSION,
+    minClientVersion: MIN_CLIENT_VERSION,
+    outdated: versionLess(member.version, MIN_CLIENT_VERSION),
   });
   // Others (re)negotiate video with this peer. On rejoin the old peer connection is dead.
   broadcast(room, { type: 'peer-join', id: member.id, name: member.name }, member.id);
@@ -215,8 +248,12 @@ function canControl(room, member) {
 
 function handleControl(ws, msg) {
   const { room, member } = ws;
-  if (!canControl(room, member)) return send(ws, { type: 'system', text: 'Only the host can control playback right now.', ts: now() });
+  if (!canControl(room, member)) return send(ws, { type: 'denied', state: room.state, hold: room.holdReason, serverTime: now(), text: 'Only the host can control playback right now.' });
   const t = now();
+  // Stop one person (or a stuck player) from jerking everyone around.
+  member.controlTimes = (member.controlTimes || []).filter(x => t - x < 3000);
+  if (member.controlTimes.length >= 6) return send(ws, { type: 'denied', state: room.state, hold: room.holdReason, serverTime: t, text: 'Too many play/pause/seek changes — slow down a little.' });
+  member.controlTimes.push(t);
   const s = room.state;
   const pos = finite(msg.position, 0, 7 * 86400) ? msg.position : currentPosition(room, t);
   let label;
@@ -261,14 +298,18 @@ function handleReport(ws, msg) {
   const ad = !!msg.ad;
   const hasVideo = !!msg.hasVideo;
   const key = clampStr(msg.key, 512) || null;
+  const duration = finite(msg.duration, 0, 7 * 86400) ? Math.round(msg.duration) : 0;
+  const label = clampStr(msg.label, 120);
   let changed = false;
   if (key !== member.key) { member.key = key; changed = true; }
+  if (Math.abs(duration - (member.duration || 0)) > 2) { member.duration = duration; changed = true; }
+  if (label !== (member.label || '')) { member.label = label; changed = true; }
   if (buffering !== member.buffering) {
     member.buffering = buffering;
     member.bufferingSince = buffering ? now() : 0;
     changed = true;
   }
-  if (ad !== member.ad) { member.ad = ad; changed = true; }
+  if (ad !== member.ad) { member.ad = ad; member.adSince = ad ? now() : 0; changed = true; }
   if (hasVideo !== member.hasVideo) { member.hasVideo = hasVideo; changed = true; }
   if (changed) { broadcastMembers(room); evaluateHold(room); }
 }
@@ -312,7 +353,10 @@ function handleChat(ws, msg) {
   member.chatTimes = (member.chatTimes || []).filter(x => t - x < 5000);
   if (member.chatTimes.length >= 8) return send(ws, { type: 'system', text: 'Slow down a little 🙂', ts: t });
   member.chatTimes.push(t);
-  broadcast(room, { type: 'chat', id: ++room.chatSeq, from: member.id, name: member.name, text, ts: t, reaction: !!msg.reaction });
+  const c = { type: 'chat', id: ++room.chatSeq, from: member.id, name: member.name, text, ts: t, reaction: !!msg.reaction };
+  room.chat.push(c);
+  if (room.chat.length > CHAT_HISTORY) room.chat.shift();
+  broadcast(room, c);
 }
 
 function handleSignal(ws, msg) {
@@ -328,6 +372,21 @@ function handleSettings(ws, msg) {
   if (typeof msg.hostOnly === 'boolean') {
     room.hostOnly = msg.hostOnly;
     system(room, msg.hostOnly ? 'Host locked the remote — only the host can control playback' : 'Everyone can control playback');
+  }
+  if (typeof msg.locked === 'boolean') {
+    room.locked = msg.locked;
+    system(room, msg.locked ? 'Host locked the party — no new people can join' : 'Party unlocked — new people can join');
+  }
+  if (typeof msg.kick === 'string' && msg.kick !== member.id && room.members.has(msg.kick)) {
+    const k = room.members.get(msg.kick);
+    room.banned.add(k.secret);
+    if (k.ws) {
+      send(k.ws, { type: 'error', code: 'kicked', message: 'The host removed you from this party.' });
+      k.ws.member = null;
+      try { k.ws.close(4001, 'kicked'); } catch {}
+    }
+    removeMember(room, k.id);
+    system(room, `${member.name} removed ${k.name}`);
   }
   if (typeof msg.makeHost === 'string' && room.members.has(msg.makeHost)) {
     room.hostId = msg.makeHost;
@@ -417,13 +476,17 @@ async function cloudflareIce() {
 }
 
 // Option B: your own coturn (TURN_URLS + TURN_SECRET) or any TURN with static TURN_USERNAME/TURN_CREDENTIAL.
+function memberBySecret(secret) {
+  for (const room of rooms.values()) { const m = room.bySecret.get(secret); if (m && m.ws) return m; }
+  return null;
+}
 function iceServers(clientId) {
   const servers = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] }];
   const turnUrls = (process.env.TURN_URLS || '').split(',').map(s => s.trim()).filter(Boolean);
   if (turnUrls.length) {
     if (process.env.TURN_SECRET) {
       // coturn "use-auth-secret" time-limited credentials
-      const username = `${Math.floor(now() / 1000) + 12 * 3600}:${clientId || 'anon'}`;
+      const username = `${Math.floor(now() / 1000) + 6 * 3600}:${crypto.createHash('sha1').update(clientId || 'anon').digest('hex').slice(0, 12)}`;
       const credential = crypto.createHmac('sha1', process.env.TURN_SECRET).update(username).digest('base64');
       servers.push({ urls: turnUrls, username, credential });
     } else if (process.env.TURN_USERNAME) {
@@ -437,13 +500,22 @@ function iceServers(clientId) {
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://x');
-  const cors = { 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' };
+  // No cross-site access: the extension has host permission, and the join page is same-origin.
+  const cors = { 'Cache-Control': 'no-store' };
   if (url.pathname === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json', ...cors });
-    return res.end(JSON.stringify({ ok: true, rooms: rooms.size }));
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', ...cors });
+    return res.end(JSON.stringify({ ok: true, version: SERVER_VERSION, rooms: rooms.size, connections: wss.clients.size, uptimeSec: Math.round(process.uptime()) }));
   }
   if (url.pathname === '/ice') {
-    const base = iceServers(clampStr(url.searchParams.get('id'), 64));
+    // Relay credentials cost money, so only hand them to people currently in a party.
+    const secret = clampStr(url.searchParams.get('id'), 64);
+    const m = isClientId(secret) && memberBySecret(secret);
+    if (!m) { res.writeHead(403, { 'Content-Type': 'application/json', ...cors }); return res.end('{"error":"join a party first"}'); }
+    const t = now();
+    m.iceTimes = (m.iceTimes || []).filter(x => t - x < 60_000);
+    if (m.iceTimes.length >= 10) { res.writeHead(429, cors); return res.end(); }
+    m.iceTimes.push(t);
+    const base = iceServers(secret);
     return cloudflareIce().then(cf => {
       res.writeHead(200, { 'Content-Type': 'application/json', ...cors });
       res.end(JSON.stringify({ iceServers: cf ? [...base, ...cf] : base }));
@@ -470,7 +542,15 @@ const server = http.createServer((req, res) => {
 });
 
 const wss = new WebSocketServer({ server, path: '/ws', maxPayload: MAX_MSG_BYTES });
-wss.on('connection', ws => {
+const connsByIp = new Map();
+const roomsByIp = new Map();
+wss.on('connection', (ws, req) => {
+  const fwd = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  ws.ip = fwd || req.socket.remoteAddress || '?';
+  const n = (connsByIp.get(ws.ip) || 0) + 1;
+  if (n > MAX_CONN_PER_IP) { try { ws.close(4029, 'too many connections'); } catch {} return; }
+  connsByIp.set(ws.ip, n);
+  ws.on('close', () => { const c = (connsByIp.get(ws.ip) || 1) - 1; if (c <= 0) connsByIp.delete(ws.ip); else connsByIp.set(ws.ip, c); });
   ws.isAlive = true;
   ws.rateWindow = 0; ws.rateCount = 0;
   ws.on('pong', () => { ws.isAlive = true; });
@@ -489,14 +569,24 @@ const sweeper = setInterval(() => {
     try { ws.ping(); } catch {}
   }
   const t = now();
+  for (const [ip, log10] of roomsByIp) { const keep = log10.filter(x => t - x < 10 * 60_000); if (keep.length) roomsByIp.set(ip, keep); else roomsByIp.delete(ip); }
   for (const room of rooms.values()) {
-    if (room.members.size === 0 && room.emptySince && t - room.emptySince > EMPTY_ROOM_TTL_MS) rooms.delete(room.id);
+    if (room.members.size === 0 && room.emptySince && t - room.emptySince > EMPTY_ROOM_TTL_MS) { rooms.delete(room.id); log('room closed', room.id, 'rooms:', rooms.size); }
     else if (room.holdReason) evaluateHold(room); // releases holds when a buffering friend exceeds the wait limit
   }
 }, SWEEP_MS);
 
+// Render (and most hosts) send SIGTERM before a restart/redeploy: tell everyone so they reconnect quickly.
+function shutdown() {
+  log('shutting down; telling', wss.clients.size, 'clients to reconnect');
+  for (const ws of wss.clients) { send(ws, { type: 'restarting' }); try { ws.close(1012, 'restarting'); } catch {} }
+  setTimeout(() => process.exit(0), 500);
+}
+
 if (require.main === module) {
-  server.listen(PORT, '0.0.0.0', () => console.log(`CouchSync server listening on :${PORT}`));
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+  server.listen(PORT, '0.0.0.0', () => log(`CouchSync server ${SERVER_VERSION} listening on :${PORT}`));
 }
 
 module.exports = { server, wss, rooms, close: () => { clearInterval(sweeper); wss.close(); server.close(); } };

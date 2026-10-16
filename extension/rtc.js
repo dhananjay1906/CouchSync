@@ -1,7 +1,9 @@
 // Peer-to-peer video mesh for up to 4 people, using the "perfect negotiation" pattern
 // so simultaneous offers, reconnects and ICE restarts don't deadlock.
 
-const VIDEO_MAX_BITRATE = 350_000; // ~350 kbps per stream keeps 3 uploads OK on normal home internet
+// Each person uploads their camera once per friend, so keep streams small and shrink them as the party grows.
+const BITRATE_BY_PEERS = { 1: 450_000, 2: 350_000, 3: 250_000 };
+const RELAY_BITRATE = 200_000; // relayed video costs real money per GB
 const VIDEO_MAX_FPS = 15;
 
 export class Mesh {
@@ -15,6 +17,23 @@ export class Mesh {
     this.iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
     this.localStream = null;
     this.mediaState = { cam: false, mic: false };
+    this.relayOnly = false;
+  }
+
+  // "Hide my IP": only use relay candidates, so friends never see your address.
+  setRelayOnly(on) { this.relayOnly = !!on; }
+
+  setPeerRoute(id, route) {
+    const p = this.peers.get(id);
+    if (!p) return;
+    p.route = route;
+    this.tuneSenders(p);
+  }
+
+  maxBitrateFor(p) {
+    const n = Math.max(1, Math.min(3, this.peers.size));
+    const base = BITRATE_BY_PEERS[n];
+    return p.route === 'relay' ? Math.min(base, RELAY_BITRATE) : base;
   }
 
   setSelfId(id) { this.selfId = id; }
@@ -52,7 +71,7 @@ export class Mesh {
       if (!sender.track || sender.track.kind !== 'video') continue;
       const params = sender.getParameters();
       if (!params.encodings || !params.encodings.length) params.encodings = [{}];
-      params.encodings[0].maxBitrate = VIDEO_MAX_BITRATE;
+      params.encodings[0].maxBitrate = this.maxBitrateFor(p);
       params.encodings[0].maxFramerate = VIDEO_MAX_FPS;
       params.degradationPreference = 'balanced';
       sender.setParameters(params).catch(() => {});
@@ -61,7 +80,7 @@ export class Mesh {
 
   addPeer(id, initiator) {
     this.removePeer(id, true);
-    const pc = new RTCPeerConnection({ iceServers: this.iceServers, bundlePolicy: 'max-bundle' });
+    const pc = new RTCPeerConnection({ iceServers: this.iceServers, bundlePolicy: 'max-bundle', iceTransportPolicy: this.relayOnly ? 'relay' : 'all' });
     const p = {
       id, pc, initiator,
       polite: this.selfId < id,
@@ -72,6 +91,7 @@ export class Mesh {
       discTimer: null,
     };
     this.peers.set(id, p);
+    for (const other of this.peers.values()) if (other !== p) this.tuneSenders(other);
 
     pc.ontrack = ({ track }) => {
       p.stream.getTracks().filter(t => t.kind === track.kind).forEach(t => p.stream.removeTrack(t));
@@ -90,10 +110,15 @@ export class Mesh {
         p.makingOffer = false;
       }
     };
+    // If nothing connects within 12s, restart ICE once (relay candidates often arrive late).
+    p.slowTimer = setTimeout(() => {
+      if (pc.connectionState !== 'connected') { this.onPeerStatus(id, 'slow'); try { pc.restartIce(); } catch {} }
+    }, 12000);
     pc.onconnectionstatechange = () => {
       const st = pc.connectionState;
       this.onPeerStatus(id, st);
       if (st === 'connected') {
+        clearTimeout(p.slowTimer);
         clearTimeout(p.discTimer);
         this.tuneSenders(p);
         this.sendSignal(id, { mediaState: this.mediaState });
@@ -116,10 +141,25 @@ export class Mesh {
     return p;
   }
 
+  // 'direct' or 'relay' — shown in Settings so we can tell what kind of connection a friend has.
+  async routeOf(id) {
+    const p = this.peers.get(id);
+    if (!p) return null;
+    try {
+      const stats = await p.pc.getStats();
+      let pair = null;
+      stats.forEach(r => { if (r.type === 'candidate-pair' && r.nominated && r.state === 'succeeded') pair = r; });
+      if (!pair) return null;
+      const local = stats.get(pair.localCandidateId), remote = stats.get(pair.remoteCandidateId);
+      return (local && local.candidateType === 'relay') || (remote && remote.candidateType === 'relay') ? 'relay' : 'direct';
+    } catch { return null; }
+  }
+
   removePeer(id, silent) {
     const p = this.peers.get(id);
     if (!p) return;
     clearTimeout(p.discTimer);
+    clearTimeout(p.slowTimer);
     try { p.pc.close(); } catch {}
     this.peers.delete(id);
     if (!silent) this.onPeerGone(id);

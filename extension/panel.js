@@ -5,10 +5,11 @@ const $ = id => document.getElementById(id);
 const params = new URLSearchParams(location.search);
 
 // ---------------- persistent prefs ----------------
-const prefs = { name: '', serverUrl: DEFAULT_SERVER, clientId: '', autoFollow: true, duck: true };
+const prefs = { name: '', serverUrl: DEFAULT_SERVER, clientId: '', autoFollow: true, duck: true, hideIp: false, headphoneTip: false };
+const VERSION = chrome.runtime.getManifest().version;
 
 async function loadPrefs() {
-  const s = await chrome.storage.local.get(['name', 'serverUrl', 'clientId', 'autoFollow', 'duck']);
+  const s = await chrome.storage.local.get(['name', 'serverUrl', 'clientId', 'autoFollow', 'duck', 'hideIp', 'headphoneTip']);
   Object.assign(prefs, Object.fromEntries(Object.entries(s).filter(([, v]) => v !== undefined)));
   if (!prefs.clientId) {
     prefs.clientId = crypto.randomUUID().replace(/-/g, '');
@@ -44,6 +45,30 @@ function mediaKey(url) {
   return `${u.origin}${p}`;
 }
 
+const vnum = v => String(v || '0').split('.').map(x => parseInt(x, 10) || 0);
+const versionLess = (a, b) => { const x = vnum(a), y = vnum(b); for (let i = 0; i < 3; i++) { if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) < (y[i] || 0); } return false; };
+
+// Sites a host can send you to automatically. Anything else needs your click.
+const TRUSTED_SITES = /(^|\.)(netflix\.com|youtube\.com|youtu\.be|primevideo\.com|amazon\.[a-z.]+|hulu\.com|disneyplus\.com|max\.com|hbomax\.com|crunchyroll\.com|paramountplus\.com|peacocktv\.com|tv\.apple\.com|tubitv\.com|pluto\.tv|twitch\.tv|vimeo\.com)$/;
+function hostOf(url) { try { return new URL(url).hostname; } catch { return ''; } }
+function originOf(url) { try { return new URL(url).origin; } catch { return ''; } }
+function safeToAutoOpen(url) {
+  if (!/^https?:/.test(url || '')) return false;
+  if (TRUSTED_SITES.test(hostOf(url))) return true;
+  // Otherwise only the exact same site you're already watching on (e.g. the next episode),
+  // never something that merely shares a hosting domain (like another *.onrender.com app).
+  const here = originOf(tabUrl);
+  return !!here && here === originOf(url) && here !== originOf(party.server || '');
+}
+
+// Prime Video and Hulu play every episode on the same page, so the URL alone can't tell episodes apart.
+// For them, the player's episode title (from the content script) becomes part of the key.
+const LABELED_SITE = /(^|\.)(primevideo\.com|amazon\.[a-z.]+|hulu\.com)$/;
+function effectiveKey(base, label) {
+  if (!base) return null;
+  return LABELED_SITE.test(hostOf(tabUrl)) && label ? `${base}|${label}` : base;
+}
+
 function fmtTime(sec) {
   sec = Math.max(0, Math.floor(sec || 0));
   const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
@@ -64,7 +89,9 @@ const party = {
 const isHost = () => party.selfId && party.selfId === party.hostId;
 let boundTabId = null;
 let tabUrl = '';
-let tabKey = null;
+let baseKey = null;   // from the URL
+let tabKey = null;    // URL key + episode label where needed
+let tabLabel = '';
 let tabTitle = '';
 const onPartyMedia = () => !!(party.media && tabKey && tabKey === party.media.key);
 
@@ -90,7 +117,7 @@ function connect() {
   sock.onopen = () => {
     retry = 0;
     bestRtt = Infinity;
-    const hello = { type: 'hello', clientId: prefs.clientId, name: prefs.name || 'Guest' };
+    const hello = { type: 'hello', clientId: prefs.clientId, name: prefs.name || 'Guest', version: VERSION };
     if (party.room) Object.assign(hello, { room: party.room, resurrect: party.joined || party.resume });
     else hello.create = true;
     send(hello);
@@ -99,9 +126,18 @@ function connect() {
     pingTimer = setInterval(() => send({ type: 'ping', t: Date.now() }), 20_000);
   };
   sock.onmessage = e => { let m; try { m = JSON.parse(e.data); } catch { return; } onServer(m); };
-  sock.onclose = () => {
+  sock.onclose = ev => {
     if (ws !== sock) return;
     clearInterval(pingTimer);
+    if (ev.code === 4000) {
+      // Same browser opened this party in another window/panel: don't fight over the seat.
+      wsWanted = false;
+      setConn('down', 'Open in another window');
+      showOtherWindowBanner();
+      return;
+    }
+    if (ev.code === 4001) return; // removed by host (handled by the error message)
+    if (ev.code === 4029) { setConn('down'); setSyncStatus('Too many connections from your network — retrying…', 'warn'); }
     setConn('down');
     if (wsWanted) scheduleReconnect();
   };
@@ -109,7 +145,8 @@ function connect() {
 }
 function scheduleReconnect() {
   if (!wsWanted) return;
-  const delay = Math.min(10_000, 1000 * 2 ** retry++) + Math.random() * 500;
+  // Random spread so 1,000 people don't all hit a restarted server in the same second.
+  const delay = Math.min(15_000, 1000 * 2 ** retry++) * (0.5 + Math.random());
   setConn('down', `Reconnecting in ${Math.round(delay / 1000)}s…`);
   retryTimer = setTimeout(connect, delay);
 }
@@ -140,8 +177,19 @@ function onServer(m) {
     case 'welcome': onWelcome(m); break;
     case 'error': onJoinError(m); break;
     case 'members':
-      party.members = m.members; party.hostId = m.hostId; party.hostOnly = m.hostOnly;
+      party.members = m.members; party.hostId = m.hostId; party.hostOnly = m.hostOnly; party.locked = !!m.locked;
       renderMembers();
+      checkFriends();
+      break;
+    case 'denied':
+      // Server refused our play/pause/seek: snap back to what everyone else is doing.
+      party.state = m.state; party.hold = m.hold;
+      pushStateToContent(true);
+      notifyOnce('denied-' + m.text, m.text, 10000);
+      break;
+    case 'restarting':
+      retry = 0;
+      addSystem('Server is restarting — reconnecting automatically…');
       break;
     case 'state':
       party.state = m.state; party.hold = m.hold;
@@ -158,12 +206,12 @@ function onServer(m) {
       break;
     case 'chat': addChat(m); break;
     case 'system': addSystem(m.text); break;
-    case 'peer-join': mesh && mesh.addPeer(m.id, true); break;
+    case 'peer-join': whenIceReady(() => { mesh && mesh.addPeer(m.id, true); setPeerStatus(m.id, 'connecting'); }); break;
     case 'peer-leave':
       if (mesh) mesh.removePeer(m.id);
       markTile(m.id, m.temporary ? 'reconnecting' : null);
       break;
-    case 'signal': mesh && mesh.handleSignal(m.from, m.data); break;
+    case 'signal': whenIceReady(() => mesh && mesh.handleSignal(m.from, m.data)); break;
   }
 }
 
@@ -178,6 +226,16 @@ function onWelcome(m) {
   chrome.storage.local.set({ currentParty: { room: m.room, server: party.server, tabId: boundTabId, at: Date.now() } });
   showView('party');
   $('room-label').textContent = `Party ${m.room}`;
+  party.locked = !!m.locked;
+  hideOtherWindowBanner();
+  if (m.outdated || (m.minClientVersion && versionLess(VERSION, m.minClientVersion))) {
+    notifyOnce('outdated', `⚠️ Your CouchSync (${VERSION}) is older than the server needs (${m.minClientVersion}). Ask the host for the new version — some things may not work.`, 3600_000);
+  }
+  if (firstTime && Array.isArray(m.chat) && m.chat.length) {
+    addSystem('— earlier messages —');
+    m.chat.forEach(addChat);
+    addSystem('— now —');
+  }
   if (m.resurrected) { lastMediaSentKey = null; addSystem('Reconnected to a restarted server — restoring the party.'); }
   // The other members will (re)offer video to us; drop any stale connections.
   mesh.setSelfId(m.selfId);
@@ -194,7 +252,8 @@ function onWelcome(m) {
 }
 
 function onJoinError(m) {
-  if (!party.joined || m.code === 'full' || m.code === 'not_found' || m.code === 'bad_room') {
+  if (!party.joined || ['full', 'not_found', 'bad_room', 'kicked', 'locked', 'busy', 'rate'].includes(m.code)) {
+    if (party.joined) leaveParty();
     disconnect();
     party.room = null; party.joined = false;
     chrome.storage.local.remove('currentParty');
@@ -203,12 +262,37 @@ function onJoinError(m) {
   }
 }
 
-async function fetchIce() {
-  try {
-    const r = await fetch(`${party.server}/ice?id=${encodeURIComponent(prefs.clientId)}`);
-    const j = await r.json();
-    mesh.setIceServers(j.iceServers);
-  } catch { /* STUN defaults still work for most people */ }
+let iceReady = Promise.resolve();
+let hasRelay = false;
+function applyHideIp() {
+  if (!mesh) return;
+  if (prefs.hideIp && !hasRelay) {
+    notifyOnce('hideip', "\"Hide my IP\" needs a relay server, and this server doesn't have one set up — your video still connects directly.", 600000);
+  }
+  mesh.setRelayOnly(prefs.hideIp && hasRelay);
+}
+function fetchIce() {
+  iceReady = (async () => {
+    let servers = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] }];
+    try {
+      const r = await fetch(`${party.server}/ice?id=${encodeURIComponent(prefs.clientId)}`, { signal: AbortSignal.timeout(4000) });
+      const j = await r.json();
+      if (Array.isArray(j.iceServers) && j.iceServers.length) servers = j.iceServers;
+    } catch { /* keep defaults */ }
+    mesh.setIceServers(servers);
+    hasRelay = servers.some(x => x.username);
+    applyHideIp();
+  })();
+  return iceReady;
+}
+
+// Keep signaling in order, but don't start any video connection before the relay info is in.
+let signalChain = Promise.resolve();
+function whenIceReady(fn) {
+  signalChain = signalChain
+    .then(() => Promise.race([iceReady, new Promise(r => setTimeout(r, 5000))]))
+    .then(fn)
+    .catch(e => console.warn(e));
 }
 
 // ---------------- the party tab ----------------
@@ -229,11 +313,17 @@ function setTabUrl(url, title) {
   tabUrl = url;
   tabTitle = title || tabTitle;
   const k = mediaKey(url);
+  if (k !== baseKey) { baseKey = k; tabLabel = ''; }
+  recomputeKey();
+  updateBanner();
+}
+
+function recomputeKey() {
+  const k = effectiveKey(baseKey, tabLabel);
   if (k !== tabKey) {
     tabKey = k;
     if (activeFrameId !== null) setActiveFrame(null);
   }
-  updateBanner();
 }
 
 async function ensureContentScript() {
@@ -254,7 +344,8 @@ async function ensureContentScript() {
 chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
   if (tabId !== boundTabId) return;
   if (info.url || info.title) setTabUrl(tab.url || tabUrl, tab.title);
-  if (info.status === 'loading' && info.url) { frames.clear(); if (activeFrameId !== null) activeFrameId = null; }
+  // Any (re)load — including a plain refresh with the same URL — replaces the page's script.
+  if (info.status === 'loading') { frames.clear(); if (activeFrameId !== null) activeFrameId = null; }
   if (info.status === 'complete') ensureContentScript();
 });
 chrome.tabs.onRemoved.addListener(tabId => {
@@ -272,9 +363,25 @@ chrome.runtime.onMessage.addListener((msg, sender) => {
   if (!msg || !msg.cs || !sender.tab || sender.tab.id !== boundTabId) return;
   const fid = sender.frameId;
   if (msg.cs === 'status') {
-    frames.set(fid, { ...msg, seen: Date.now() });
+    frames.set(fid, { ...msg, seen: Date.now(), firstSeen: frames.get(fid)?.firstSeen || Date.now() });
+    // The page script forgot it's the party player (e.g. it was reloaded): remind it.
+    if (fid === activeFrameId && msg.active === false && msg.hasVideo) {
+      chrome.tabs.sendMessage(boundTabId, { cs: 'activate', active: true }, { frameId: fid }).catch(() => {});
+      pushStateToContent(true);
+    }
+    if (msg.hasVideo && typeof msg.label === 'string' && msg.label !== tabLabel && (msg.top || !frames.get(0)?.label)) {
+      tabLabel = msg.label;
+      recomputeKey();
+      if (party.media) handleMediaChange();
+    }
     chooseFrame();
   } else if (msg.cs === 'event' && fid === activeFrameId && party.joined) {
+    if (party.hostOnly && !isHost()) {
+      // Guests can't drive playback in host-only mode: put their player back right away.
+      pushStateToContent(true);
+      notifyOnce('hostonly', 'Only the host can play, pause or skip right now.', 10000);
+      return;
+    }
     const ctl = { type: 'control', action: msg.action, position: msg.position };
     if (msg.action === 'rate') ctl.rate = msg.rate;
     send(ctl);
@@ -285,6 +392,8 @@ chrome.runtime.onMessage.addListener((msg, sender) => {
       if (msg.action === 'pause') party.state = { ...party.state, playing: false, position: msg.position, at: t };
       if (msg.action === 'seek') party.state = { ...party.state, position: msg.position, at: t };
     }
+  } else if (msg.cs === 'seek-broken') {
+    notifyOnce('seek-broken', "This site's player isn't accepting jumps from CouchSync right now. Playback still syncs; use ⇆ Sync all to me if someone drifts.", 600000);
   } else if (msg.cs === 'autoplay-blocked') {
     setSyncStatus('▶ Click the video (or the orange button on it) once so it can sync.', 'warn');
   }
@@ -338,6 +447,7 @@ let lastMediaSentKey = null;
 let mediaSending = false;
 async function maybeSendMedia(f) {
   if (!party.joined || !isHost() || !f || !tabKey || mediaSending) return;
+  if (LABELED_SITE.test(hostOf(tabUrl)) && !tabLabel && Date.now() - (f.firstSeen || f.seen) < 6000) return; // give the episode title a moment
   if (party.media && party.media.key === tabKey) return;
   if (lastMediaSentKey === tabKey) return;
   const fid = [...frames.entries()].find(([, x]) => x === f)?.[0];
@@ -349,7 +459,8 @@ async function maybeSendMedia(f) {
     if (!snap || !snap.hasVideo || (!(snap.duration > 0) && snap.paused)) return;
     if (lastMediaSentKey === tabKey || (party.media && party.media.key === tabKey)) return;
     lastMediaSentKey = tabKey;
-    send({ type: 'media', url: tabUrl, key: tabKey, title: tabTitle, duration: snap.duration || 0, position: snap.currentTime, playing: !snap.paused });
+    const title = tabLabel && !tabTitle.includes(tabLabel) ? `${tabTitle} — ${tabLabel}` : tabTitle;
+    send({ type: 'media', url: tabUrl, key: tabKey, title, duration: snap.duration || 0, position: snap.currentTime, playing: !snap.paused });
   } finally {
     mediaSending = false;
   }
@@ -358,7 +469,16 @@ async function maybeSendMedia(f) {
 function handleMediaChange() {
   if (!party.media) { chooseFrame(); updateBanner(); return; }
   if (!onPartyMedia() && !isHost() && prefs.autoFollow && boundTabId !== null) {
-    chrome.tabs.update(boundTabId, { url: party.media.url }).catch(() => {});
+    const samePage = mediaKey(party.media.url) === baseKey;
+    if (samePage) {
+      // Same page, different episode (Prime/Hulu): reloading wouldn't help — tell them what to pick.
+      // (If our own episode title hasn't loaded yet, wait: it's probably the same episode.)
+      if (tabLabel) notifyOnce('pick-' + party.media.key, `Host switched to: ${party.media.title || 'another episode'}. Pick it in the player — everyone waits up to 20s.`, 60000);
+    } else if (safeToAutoOpen(party.media.url)) {
+      chrome.tabs.update(boundTabId, { url: party.media.url }).catch(() => {});
+    } else {
+      notifyOnce('unsafe-' + party.media.url, `Host opened a page on ${hostOf(party.media.url)}. It won't open automatically — use the button at the top if you trust it.`, 60000);
+    }
   }
   chooseFrame();
   updateBanner();
@@ -370,9 +490,12 @@ setInterval(() => {
   if (!party.joined) return;
   chooseFrame();
   const f = activeStatus();
-  const rep = { type: 'report', hasVideo: !!f, buffering: !!(f && f.buffering), ad: !!(f && f.ad), key: tabKey };
+  const rep = { type: 'report', hasVideo: !!f, buffering: !!(f && f.buffering), ad: !!(f && f.ad), key: tabKey,
+    duration: f && f.duration ? Math.round(f.duration / 5) * 5 : 0, label: tabLabel };
   const k = JSON.stringify(rep);
-  if (k !== lastReport || ++reportTick % 4 === 0) { send(rep); lastReport = k; }
+  if (k !== lastReport || ++reportTick % 15 === 0) { send(rep); lastReport = k; reportTick = 0; }
+  // Keep the content script awake only while we're in a party (it sleeps otherwise to save CPU/battery).
+  if (boundTabId !== null) chrome.tabs.sendMessage(boundTabId, { cs: 'wake' }).catch(() => {});
   updateSyncStatus();
 }, 1000);
 
@@ -401,6 +524,7 @@ function updateSyncStatus() {
 
 let bannerAction = null;
 async function updateBanner() {
+  if (otherWindow) return;
   const b = $('banner');
   let text = '', btn = '', action = null;
   if (party.joined) {
@@ -409,7 +533,8 @@ async function updateBanner() {
     if (boundTabId === null) {
       text = 'The party tab was closed.'; btn = 'Use this tab'; action = rebindToCurrent;
     } else if (party.media && !onPartyMedia()) {
-      text = `${isHost() ? 'Party video' : 'Host is watching'}: ${party.media.title || 'a video'}`;
+      const where = safeToAutoOpen(party.media.url) ? '' : ` (${hostOf(party.media.url)})`;
+      text = `${isHost() ? 'Party video' : 'Host is watching'}: ${party.media.title || 'a video'}${where}`;
       btn = isHost() ? 'Go back' : 'Open it';
       action = () => chrome.tabs.update(boundTabId, { url: party.media.url, active: true });
     } else if (activeTab && activeTab.id !== boundTabId) {
@@ -424,6 +549,17 @@ async function updateBanner() {
   bannerAction = action;
 }
 $('banner-action').addEventListener('click', () => bannerAction && bannerAction());
+
+function showOtherWindowBanner() {
+  $('banner-text').textContent = 'This party is open in another window.';
+  $('banner-action').textContent = 'Use it here';
+  $('banner-action').classList.remove('hidden');
+  $('banner').classList.remove('hidden');
+  bannerAction = () => { hideOtherWindowBanner(); retry = 0; connect(); };
+  otherWindow = true;
+}
+let otherWindow = false;
+function hideOtherWindowBanner() { if (otherWindow) { otherWindow = false; updateBanner(); } }
 
 // ---------------- chat ----------------
 function addChat(m) {
@@ -465,6 +601,7 @@ $('chat-form').addEventListener('submit', e => {
 document.querySelectorAll('.reactions button').forEach(b => b.addEventListener('click', () => send({ type: 'chat', text: b.dataset.r, reaction: true })));
 
 // ---------------- members ----------------
+let kickArmed = {};
 function renderMembers() {
   const box = $('members');
   box.textContent = '';
@@ -475,19 +612,42 @@ function renderMembers() {
     left.textContent = `${m.id === party.hostId ? '👑 ' : ''}${m.name}${m.id === party.selfId ? ' (you)' : ''}`;
     const meta = document.createElement('span');
     meta.className = 'meta';
-    meta.textContent = !m.connected ? 'reconnecting…' : m.ad ? 'ad' : m.buffering ? 'buffering' : m.ready ? 'ready' : 'no video yet';
+    const tile = tiles.get(m.id);
+    const route = tile && tile.el.dataset.route ? ` · video ${tile.el.dataset.route}` : (m.id !== party.selfId && tile ? ' · video not connected' : '');
+    meta.textContent = (!m.connected ? 'reconnecting…' : m.ad ? 'ad' : m.buffering ? 'buffering' : m.ready ? 'ready' : 'no video yet') + route;
     row.append(left, meta);
-    if (isHost() && m.id !== party.selfId && m.connected) {
-      const mk = document.createElement('button');
-      mk.className = 'small';
-      mk.textContent = 'Make host';
-      mk.addEventListener('click', () => send({ type: 'settings', makeHost: m.id }));
-      row.append(mk);
+    if (m.version && m.version !== VERSION) meta.textContent += ` · v${m.version}`;
+    if (isHost() && m.id !== party.selfId) {
+      const btns = document.createElement('span');
+      btns.className = 'member-btns';
+      if (m.connected) {
+        const mk = document.createElement('button');
+        mk.className = 'small';
+        mk.textContent = 'Make host';
+        mk.addEventListener('click', () => send({ type: 'settings', makeHost: m.id }));
+        btns.append(mk);
+      }
+      const kick = document.createElement('button');
+      kick.className = 'small danger';
+      kick.textContent = 'Remove';
+      kick.title = 'Remove from the party (they cannot rejoin this party)';
+      // Two-step confirm that survives the list re-rendering.
+      const armed = kickArmed.id === m.id && Date.now() < kickArmed.until;
+      if (armed) kick.textContent = 'Sure?';
+      kick.addEventListener('click', () => {
+        if (kickArmed.id === m.id && Date.now() < kickArmed.until) { kickArmed = {}; send({ type: 'settings', kick: m.id }); return; }
+        kickArmed = { id: m.id, until: Date.now() + 4000 };
+        renderMembers();
+        setTimeout(renderMembers, 4100);
+      });
+      btns.append(kick);
+      row.append(btns);
     }
     box.append(row);
   }
   $('set-hostonly').checked = party.hostOnly;
-  document.querySelector('.host-only-setting').classList.toggle('hidden', !isHost());
+  $('set-lock').checked = !!party.locked;
+  document.querySelectorAll('.host-only-setting').forEach(el => el.classList.toggle('hidden', !isHost()));
   // tiles
   const ids = new Set(party.members.filter(m => m.id !== party.selfId).map(m => m.id));
   for (const id of [...tiles.keys()]) if (id !== 'self' && !ids.has(id)) { tiles.get(id).el.remove(); tiles.delete(id); }
@@ -498,6 +658,19 @@ function renderMembers() {
     t.el.classList.toggle('reconnecting', !m.connected);
   }
   layoutGrid();
+}
+
+// Warn about things that silently break a party: old versions, different cuts of a movie.
+function checkFriends() {
+  const me = party.members.find(x => x.id === party.selfId);
+  for (const m of party.members) {
+    if (m.id === party.selfId || !m.connected) continue;
+    if (m.version && versionLess(m.version, VERSION)) notifyOnce('old-' + m.id, `${m.name} is on an older CouchSync (v${m.version}). Send them the new version so things work for both of you.`, 3600_000);
+    if (me && me.duration && m.duration && onPartyMedia() && Math.abs(me.duration - m.duration) > 60) {
+      const diff = Math.round(Math.abs(me.duration - m.duration) / 60);
+      notifyOnce('len-' + m.id + '-' + party.media?.key, `${m.name}'s video is about ${diff} min ${m.duration > me.duration ? 'longer' : 'shorter'} than yours — you may be on different versions (extended cut, region, or ads), so scenes won't line up perfectly.`, 3600_000);
+    }
+  }
 }
 
 // ---------------- video tiles ----------------
@@ -521,6 +694,23 @@ function setTileName(id, name) {
   if (!t) return;
   t.el.querySelector('.nm').textContent = name;
   t.el.querySelector('.avatar').textContent = initials(name.replace('👑 ', '').replace(' (you)', ''));
+}
+const STATUS_TEXT = {
+  connecting: 'Connecting video…',
+  checking: 'Connecting video…',
+  slow: 'Still connecting… (trying relay)',
+  failed: "Can't reach this friend's video — retrying",
+};
+function setPeerStatus(id, st) {
+  const m = party.members.find(x => x.id === id);
+  const t = tiles.get(id) || (m ? ensureTile(id, m.name) : null);
+  if (!t) return;
+  let el = t.el.querySelector('.conn-status');
+  if (!el) { el = document.createElement('div'); el.className = 'conn-status'; t.el.append(el); }
+  const text = STATUS_TEXT[st] || '';
+  el.textContent = text;
+  el.classList.toggle('hidden', !text);
+  t.el.classList.toggle('conn-bad', st === 'failed');
 }
 function markTile(id, state) {
   const t = tiles.get(id);
@@ -591,6 +781,12 @@ async function startLocalMedia(fromPermissionPage) {
   watchLevel('self', stream);
   refreshTileVideo('self');
   updateMediaButtons();
+  headphoneTip();
+}
+function headphoneTip() {
+  if (prefs.headphoneTip || !liveTracks('audio').length) return;
+  savePrefs({ headphoneTip: true });
+  addSystem('🎧 Tip: wear headphones — otherwise your mic picks up the movie and friends hear it twice.');
 }
 
 let permissionTabOpening = false;
@@ -681,6 +877,7 @@ async function toggleMic() {
     } else if (!liveTracks('audio').length) { if (!(await acquire('audio'))) return; micOn = true; }
     else micOn = !micOn;
     await applyLocalChange();
+    headphoneTip();
   } finally { toggling = false; }
 }
 
@@ -791,7 +988,13 @@ function createMesh() {
       const t = tiles.get(id);
       if (!t) return;
       if (mediaState) { t.mediaState = mediaState; refreshTileVideo(id); }
-      if (conn === 'failed') addSystem('Video link to a friend failed — retrying. If it keeps failing, add a TURN server (see README).');
+      if (conn) setPeerStatus(id, conn);
+      if (conn === 'failed') notifyOnce('rtc-fail-' + id, "Couldn't connect video with a friend — retrying through a relay. If it never connects, one of you may be on a network that blocks video calls (some office/school Wi-Fi).", 60000);
+      if (conn === 'connected') mesh.routeOf(id).then(r => {
+        const t2 = tiles.get(id);
+        if (t2) { t2.el.dataset.route = r || ''; renderMembers(); }
+        mesh.setPeerRoute(id, r); // relay connections use less bandwidth (and cost less)
+      });
     },
   });
 }
@@ -873,6 +1076,7 @@ $('open-settings').addEventListener('click', () => {
   $('set-name').value = prefs.name;
   $('set-follow').checked = prefs.autoFollow;
   $('set-duck').checked = prefs.duck;
+  $('set-hideip').checked = !!prefs.hideIp;
   renderMembers();
   $('settings').classList.remove('hidden');
 });
@@ -886,6 +1090,35 @@ $('set-name').addEventListener('change', async () => {
 $('set-follow').addEventListener('change', e => savePrefs({ autoFollow: e.target.checked }));
 $('set-duck').addEventListener('change', e => savePrefs({ duck: e.target.checked }));
 $('set-hostonly').addEventListener('change', e => send({ type: 'settings', hostOnly: e.target.checked }));
+$('set-lock').addEventListener('change', e => send({ type: 'settings', locked: e.target.checked }));
+$('set-hideip').addEventListener('change', async e => {
+  await savePrefs({ hideIp: e.target.checked });
+  applyHideIp();
+  if (mesh && party.joined) {
+    // Reconnect video so the new setting takes effect.
+    mesh.closeAll();
+    for (const m of party.members) if (m.id !== party.selfId && m.connected) whenIceReady(() => { mesh.addPeer(m.id, true); setPeerStatus(m.id, 'connecting'); });
+  }
+});
+$('copy-debug').addEventListener('click', async () => {
+  const info = await debugInfo();
+  try { await navigator.clipboard.writeText(info); addSystem('Debug info copied — paste it to whoever is helping you.'); }
+  catch { addSystem(info); }
+});
+async function debugInfo() {
+  const routes = await Promise.all(party.members.filter(m => m.id !== party.selfId).map(async m => `${m.name}: ${m.connected ? 'online' : 'offline'}, v${m.version || '?'}, video=${(mesh && (await mesh.routeOf(m.id))) || 'not connected'}, state=${mesh?.peers.get(m.id)?.pc.connectionState || '-'}`));
+  const f = activeStatus();
+  return [
+    `CouchSync v${VERSION} · ${navigator.userAgent}`,
+    `server ${party.server} · party ${party.room} · host=${isHost()} · hostOnly=${party.hostOnly} · locked=${!!party.locked}`,
+    `relay available=${hasRelay} · hideIp=${prefs.hideIp}`,
+    `tab ${hostOf(tabUrl)} · key=${tabKey} · party key=${party.media?.key || '-'}`,
+    `player: ${f ? `t=${f.currentTime.toFixed(1)} dur=${Math.round(f.duration)} paused=${f.paused} buffering=${f.buffering} ad=${f.ad}` : 'not found'}`,
+    `party: ${party.state ? `${party.state.playing ? 'playing' : 'paused'} @ ${expectedPosition().toFixed(1)}` : '-'} hold=${party.hold || '-'}`,
+    `cam=${camOn} mic=${micOn}`,
+    ...routes,
+  ].join('\n');
+}
 $('rebind').addEventListener('click', async () => { await rebindToCurrent(); $('settings').classList.add('hidden'); addSystem('Party moved to this tab.'); });
 $('cam-permission').addEventListener('click', openPermissionPage);
 $('leave').addEventListener('click', leaveParty);

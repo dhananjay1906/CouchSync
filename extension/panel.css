@@ -85,3 +85,8 @@ button.icon { background: transparent; border: 0; padding: 6px; font-size: 16px;
 .member .meta { color: var(--muted); font-size: 12px; }
 
 .sound-btn { margin: 8px 12px 0; flex: none; }
+.tile .conn-status { position: absolute; left: 6px; right: 6px; top: 6px; font-size: 11px; color: #fff; background: rgba(0,0,0,.6); padding: 3px 6px; border-radius: 6px; text-align: center; }
+.tile.conn-bad { border-color: var(--bad); }
+.member { flex-wrap: wrap; gap: 6px; }
+.member-btns { display: flex; gap: 4px; }
+.member-btns .danger { padding: 6px 10px; }

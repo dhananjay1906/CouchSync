@@ -67,47 +67,75 @@ Each friend: unzip → `chrome://extensions` → Developer mode → **Load unpac
 
 ---
 
+## Settings (⚙️ in the panel)
+- **Only I (host) can play / pause / seek** — guests' changes are undone and they're told why.
+- **Lock party** — nobody new can join. **Remove** next to a name kicks someone; they can't rejoin that party.
+- **Hide my IP address** — video goes through the relay so friends never see your IP (needs a relay server).
+- **Lower movie volume while friends talk**, **Auto-open the host's video**.
+- **Copy debug info** — paste it to whoever is helping you when something breaks.
+
 ## What can go wrong, and what CouchSync does about it
 
 | Problem | How it's handled |
 |---|---|
-| Someone's internet is slow / buffering | Everyone pauses with "⏸ Waiting for Ben…" and resumes together. If one person is stuck more than 20s, the rest carry on so one bad connection can't freeze the party. |
-| Someone gets an ad (YouTube, ad-supported Prime/Hulu) | Same as buffering: the others wait, then everyone resumes. |
-| Small drift over a long movie | Checked every second. Under 1.5s it's corrected by speeding up or slowing down slightly (unnoticeable); bigger drift triggers a seek. Tested: stays within about 0.3s. |
-| Infinite "you paused → I paused → you paused" loops | Every play/pause/seek is tagged as "ours" or "the user's"; only user actions are broadcast. |
-| Netflix crashes when seeked (error M7375) | Seeks use Netflix's own player API instead of the video element. |
-| Disney+ hides the video in a closed shadow DOM | Uses Chrome's `chrome.dom.openOrClosedShadowRoot` to find it. |
-| Players inside iframes (many smaller sites) | The script runs in all frames and the panel picks the largest playing video. |
-| Thumbnails or preview trailers mistaken for the movie | Small videos are ignored; on known sites only real player pages (e.g. `/watch/…`) count. |
-| Host goes to the next episode, or Netflix autoplays it | Friends' tabs automatically open the same episode; everyone waits until all have loaded it. |
-| Chrome blocks autoplay for a friend | A big "▶ Click to sync" button appears on their video. One click fixes it. |
-| Wi-Fi blip, laptop sleeps, panel closed by accident | Auto-reconnects with backoff. Your seat is held for 30 seconds, and reopening the panel rejoins the same party. |
-| Server restarts (e.g. Render redeploy) | Everyone reconnects and the party is rebuilt with the same invite link and position. Tested. |
-| Host leaves | The next person automatically becomes host. |
-| Video call can't connect (strict office/school/mobile networks) | Automatic ICE restart. For the roughly 10–20% of networks that block direct connections, add a TURN relay (below). |
-| Camera busy in Zoom/Teams, or no camera | Falls back to mic only, or watch-only. You still see everyone else. |
-| A 5th person tries to join | Told clearly "This party is full (max 4)." |
-| Spam / huge messages | Chat length limits and rate limits on the server. |
-| Tab opened before installing the extension | The panel injects the script into it automatically. |
+| Players act on their own (autoplay, "resume where you left off", buffering blips) | Only actions after a real click/key are shared; anything the player does by itself is put back to the party's position. |
+| Media keys, headphone buttons, picture-in-picture, "Are you still watching?" | A no-click pause/play that sticks for ~1.5s is treated as real and shared — no pause/play fight. |
+| Someone refreshes the video page or reopens the invite link | The page re-syncs by itself; no rewinds for anyone else. |
+| Slow internet / buffering | Everyone waits once (max 20s), then the slow person catches up quietly instead of pausing everyone again. |
+| Ads | Everyone waits — but never more than 3 minutes, so a stuck ad can't freeze the party. |
+| Prime Video / Hulu change episodes without changing the URL | The episode title is part of the sync key; friends are told which episode to pick and the party waits for them. |
+| Different editions/regions (lengths differ) | Friends are warned that scenes won't line up. |
+| Host-only mode | Guests snap back instantly instead of drifting. |
+| Party open in two windows | The old window stops and offers "Use it here" — no reconnect loop. |
+| Side panel closed | The video page shows "you're no longer synced" with a Reopen button. |
+| Player fullscreen hides the panel | A one-time hint explains Esc → F11. |
+| Netflix changes its internal player | Detected and shown; play/pause still sync, use ⇆ if someone drifts. |
+| Old extension versions | Friends on old versions are flagged; the server warns outdated clients. |
+| Impersonation / kicking someone by their ID | Public IDs are separate from each person's secret ID. |
+| Host sends friends to a random website | Only known streaming sites (or the same site you're on) open automatically; anything else needs a click and shows the site name. |
+| Strangers using your relay (and your bill) | Relay credentials only go to people currently in a party, rate-limited. |
+| Floods / spam | Limits on connections and new parties per network, total parties, play/pause/seek spam, and chat. |
+| Server restart / redeploy | Clients are told, reconnect with random spread, and the party is rebuilt. |
+| Idle tabs | The extension sleeps on every tab unless you're in a party. |
+| Video calls blocked by strict networks | Needs a relay (TURN) — see below. Tiles show "Connecting…/Can't reach" and Settings shows direct vs relay. |
+| Upload bandwidth / relay cost | Video bitrate drops as the party grows and on relay connections. |
+| Late joiners | See the last 50 chat messages. |
 
-### Optional: TURN relay for friends behind strict networks
-If one friend's video never connects (everything else works), set these on your Render service (**Environment**):
+### Server settings (environment variables on Render)
+| Variable | Default | What it does |
+|---|---|---|
+| `CF_TURN_KEY_ID`, `CF_TURN_API_TOKEN` | — | Cloudflare relay (free up to 1,000 GB/month). Strongly recommended. |
+| `TURN_URLS` + `TURN_SECRET` or `TURN_USERNAME`/`TURN_CREDENTIAL` | — | Any other TURN relay (coturn, ExpressTURN, Metered). |
+| `MIN_CLIENT_VERSION` | 1.1.0 | Older extensions get an "update" warning. |
+| `MAX_MEMBERS` | 4 | People per party. |
+| `MAX_ROOMS` | 5000 | Total parties at once. |
+| `MAX_CONN_PER_IP` | 30 | Connections from one network. |
+| `MAX_ROOMS_PER_IP_PER_10MIN` | 10 | New parties from one network per 10 minutes. |
+| `AD_WAIT_LIMIT_MS` | 180000 | Longest everyone waits for one person's ad. |
 
-- **Cloudflare (free up to 1,000 GB/month):** create a TURN key in the Cloudflare dashboard (Realtime → TURN), then set `CF_TURN_KEY_ID` and `CF_TURN_API_TOKEN`.
-- **Or your own coturn:** `TURN_URLS=turn:your.host:3478` and `TURN_SECRET=<static-auth-secret>`.
+## Still not solved (needs money, a store listing, or a different design)
+- **Video calls on blocked networks need a relay account** (Cloudflare/ExpressTURN signup).
+- **Updates are manual** until it's on the Chrome Web Store ($5 one-time + review; see PRIVACY.md and the checklist below). Chrome also shows a developer-mode warning for unpacked extensions.
+- **Closing the side panel still stops syncing** (you get a notice and a Reopen button, but the sync lives in the panel).
+- **Fullscreen hides the panel** — use F11.
+- **Not tested on the real Netflix/Prime/Hulu/Disney+/Max players** — only on test pages that imitate them. Expect small fixes.
+- **Ad-stitched streams** (some Prime/Hulu ad plans) can still drift; ad-free plans sync best.
+- **One server instance**: parties live in memory. Fine for friends and small groups; for thousands of users you'd move party state to Redis and run several servers, and pay for the relay traffic (~$0.05/GB on Cloudflare after 1,000 GB).
+- **No phones, Safari, or Firefox.** Max 4 people (bigger groups need a paid media server).
 
-## Honest limits
-- **Real streaming sites were not tested here.** I couldn't sign into Netflix, Prime or Disney+ from the build machine. The sync engine, 4-way video, invite links and reconnects were tested end-to-end in real Chrome against a test video page. Netflix, YouTube, Disney+, Prime, Hulu and Max have specific handling based on how their players are known to work, and any other site with a normal HTML5 video should work generically. These sites change their players without warning, so expect to tweak `content.js` occasionally. If a site misbehaves, the "⇆ Sync all to me" button force-aligns everyone.
-- **Ad-supported tiers that stitch ads into the stream** (some Prime/Hulu plans) can shift timestamps differently per person. Ad-free plans sync best.
-- **Everyone needs the same title available.** Region-locked shows may not exist for a friend in another country.
-- **Mesh video caps at 4 people.** Each person uploads their camera to 3 others at about 350 kbps each. Past 4 you'd need a media server (e.g. LiveKit).
-- Don't use the name "Teleparty" or its logo, and check each streaming service's terms. Syncing playback is how all these tools work, but don't try to rebroadcast video.
+### Chrome Web Store checklist (if you publish)
+1. Pick a name/logo that doesn't use any streaming service's or Teleparty's trademarks.
+2. Host PRIVACY.md somewhere public and link it.
+3. Justify permissions: "all sites" (to find the video player on any streaming site), tabs, side panel, storage, scripting.
+4. $5 developer registration, upload the zipped `extension` folder, wait for review.
 
 ## Tests
 ```bash
-cd server && npm test          # 12 server tests: sync, holds, ads, reconnects, limits, signaling
+cd server && npm test          # 17 server tests: sync, holds, ads, reconnects, limits, kick/lock, impersonation, spam
 cd e2e && python3 e2e.py       # 2 people in real Chrome: sync, chat, video, episode switch, server restart
 python3 e2e4.py                # 4 people: all in sync, everyone sees 3 faces, 5th rejected
 python3 e2e_join.py            # invite-link flow
+python3 e2e_v11.py             # media keys, still-watching, host-only, two windows, kick/lock, idle tabs, episodes
+PAGE=yt2.html python3 e2e_rejoin.py  # rejoin with YouTube-like player quirks (no rewinds)
 ```
 (e2e tests need `pip install playwright && playwright install chromium`, and the `CHROME` path in `e2e.py` adjusted for your machine.)

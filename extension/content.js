@@ -1,5 +1,5 @@
-// CouchSync content script. Runs in every frame of every page, but stays idle
-// until the side panel activates the frame that holds the main video.
+// CouchSync content script. Runs in every frame of every page, but sleeps (no scanning, no messages)
+// unless the CouchSync panel is in a party and has woken this tab up.
 (() => {
   if (window.__couchsyncLoaded) return;
   window.__couchsyncLoaded = true;
@@ -37,6 +37,9 @@
   let blocked = false;      // autoplay blocked; needs a click
   let duckOn = false, duckSavedVolume = null;
   let lastReportKey = '';
+  let lastWake = 0;          // panel pings us every second while in a party
+  const awake = () => Date.now() - lastWake < 15000;
+  let label = '';            // episode title for sites that play every episode on one page
 
   const serverNow = () => Date.now() + clockOffset;
   function expected() {
@@ -89,12 +92,59 @@
     return best;
   }
 
+  // ---------- was it really the person? ----------
+  // Players do lots of things on their own: autoplay on load, jump to "where you left off",
+  // brief pause/play blips around buffering or quality changes. Only actions that follow a
+  // real click / key press / tap are shared with the party; everything else is corrected locally.
+  let lastUserInput = 0;
+  let settleUntil = 0, settleStart = 0;
+  const USER_WINDOW_MS = 3000;
+  const markInput = e => { if (e.isTrusted) lastUserInput = Date.now(); };
+  ['pointerdown', 'pointerup', 'keydown', 'touchstart', 'click'].forEach(t => window.addEventListener(t, markInput, true));
+  // Called when the player (re)loads: for a few seconds, only input made after the load counts.
+  const settle = (ms = 4000) => {
+    const now = Date.now();
+    if (now >= settleUntil) settleStart = now;
+    settleUntil = Math.max(settleUntil, now + ms);
+  };
+  const userCaused = () => {
+    const now = Date.now();
+    if (now - lastUserInput > USER_WINDOW_MS) return false;
+    // While the player is (re)loading, only count input that happened after it started loading.
+    return now >= settleUntil || lastUserInput >= settleStart - 500;
+  };
+  let correctTimer = null;
+  let lastBufferHoldAt = 0;
+  const inSettle = () => Date.now() < settleUntil;
+  // Corrections we made recently. If the player keeps undoing them, stop fighting.
+  let corrections = [];
+  function fighting() {
+    const now = Date.now();
+    corrections = corrections.filter(t => now - t < 20000);
+    return corrections.length >= 3;
+  }
+  function correctSoon(ms = 250) {
+    corrections.push(Date.now());
+    clearTimeout(correctTimer);
+    correctTimer = setTimeout(() => applyTarget(true), ms);
+  }
+  // A play/pause with no click: could be a media key, headphone button, picture-in-picture,
+  // or a site prompt ("Are you still watching?"). If it sticks for a moment and isn't a load blip,
+  // treat it as real and share it, instead of fighting the player.
+  let pendingTimer = null;
+  function confirmLater(action, ms, stillTrue) {
+    clearTimeout(pendingTimer);
+    pendingTimer = setTimeout(() => { pendingTimer = null; if (stillTrue()) emit(action); }, ms);
+  }
+  function cancelPending() { clearTimeout(pendingTimer); pendingTimer = null; }
+
   const EVENTS = ['play', 'pause', 'seeked', 'ratechange', 'waiting', 'playing', 'canplay', 'stalled', 'loadedmetadata', 'emptied'];
   function attach(v) {
     if (video === v) return;
     if (video) EVENTS.forEach(ev => video.removeEventListener(ev, onVideoEvent));
     video = v;
     ourRate = null;
+    settle();
     if (video) {
       EVENTS.forEach(ev => video.addEventListener(ev, onVideoEvent));
       if (active && target) applyTarget(true);
@@ -126,11 +176,23 @@
     lastSeekTarget = t; lastSeekAt = Date.now();
     if (site === 'netflix') {
       // Setting video.currentTime on Netflix triggers error M7375; use its player API from the page world.
+      nfAcked = false;
       window.postMessage({ source: 'couchsync-cs', cmd: 'seek', ms: Math.round(t * 1000) }, '*');
+      setTimeout(() => { if (!nfAcked) seekFailed(); }, 2000);
       return;
     }
     try { video.currentTime = t; } catch {}
   }
+
+  let nfAcked = true, seekFails = 0;
+  function seekFailed() {
+    if (++seekFails === 3) chrome.runtime.sendMessage({ cs: 'seek-broken' }).catch(() => {});
+  }
+  window.addEventListener('message', e => {
+    if (e.source !== window || !e.data || e.data.source !== 'couchsync-nf') return;
+    nfAcked = true;
+    if (e.data.ok) seekFails = 0; else seekFailed();
+  });
 
   let expectPlayUntil = 0, expectPauseUntil = 0;
   function nativePlay() {
@@ -168,7 +230,8 @@
   // Gentle drift correction: nudge speed for small drift, seek for big drift.
   function driftCheck() {
     if (!active || !video || !target || ad || buffering || blocked) return;
-    if (Date.now() - lastSeekAt < 3000) return;
+    if (pendingTimer) return; // deciding whether a no-click pause/play was real: don't undo it meanwhile
+    if (Date.now() - lastSeekAt < 6000) return;
     const dur = video.duration;
     if (!Number.isFinite(dur) || video.readyState < 3) return;
     const exp = expected();
@@ -205,28 +268,45 @@
       case 'play':
         hideBlocked();
         if (Date.now() < expectPlayUntil) { expectPlayUntil = 0; break; } // we started it
-        if (target && !target.playing) emit('play');
+        cancelPending(); // a pause→play blip is not a real pause
+        if (target && !target.playing) {
+          if (userCaused()) emit('play');
+          else if (inSettle() && !fighting()) correctSoon();
+          else confirmLater('play', 700, () => video && !video.paused && target && !target.playing && !ad);
+        }
         break;
       case 'pause':
         if (Date.now() < expectPauseUntil) { expectPauseUntil = 0; break; } // we paused it
-        if (target && target.playing && !v.ended && !buffering) emit('pause');
+        if (target && target.playing && !v.ended && !buffering) {
+          if (userCaused()) emit('pause');
+          else if (inSettle() && !fighting()) correctSoon(800); // load-time blip; resume
+          else confirmLater('pause', 1500, () => video && video.paused && !video.ended && !buffering && target && target.playing && !ad);
+        }
         break;
       case 'seeked': {
         const exp = expected();
         const ours = lastSeekTarget !== null && Date.now() - lastSeekAt < 4000 && Math.abs(v.currentTime - lastSeekTarget) < 1.5;
-        if (!ours && exp !== null && Math.abs(v.currentTime - exp) > 2) emit('seek');
+        if (!ours && exp !== null && Math.abs(v.currentTime - exp) > 2) {
+          if (userCaused()) emit('seek'); else correctSoon(); // e.g. "resume where you left off"
+        }
         break;
       }
       case 'ratechange':
         if (ourRate !== null && Math.abs(v.playbackRate - ourRate) > 0.01 && target && Math.abs(v.playbackRate - target.rate) > 0.01) {
-          ourRate = v.playbackRate;
-          emit('rate', { rate: v.playbackRate });
+          if (userCaused()) { ourRate = v.playbackRate; emit('rate', { rate: v.playbackRate }); }
+          else correctSoon();
         }
         break;
       case 'waiting':
       case 'stalled':
         clearTimeout(waitingTimer);
-        waitingTimer = setTimeout(() => { if (video && video.readyState < 3) { buffering = true; report(true); } }, 1000);
+        waitingTimer = setTimeout(() => {
+          if (!video || video.readyState >= 3) return;
+          // At most one "wait for me" per 20s; after that, catch up quietly instead of pausing everyone again.
+          if (Date.now() - lastBufferHoldAt < 20000) return;
+          lastBufferHoldAt = Date.now();
+          buffering = true; report(true);
+        }, 2500);
         break;
       case 'playing':
       case 'canplay':
@@ -236,6 +316,7 @@
         break;
       case 'loadedmetadata':
       case 'emptied':
+        settle();
         if (active) setTimeout(() => applyTarget(true), 300);
         break;
     }
@@ -266,12 +347,71 @@
     if (blockedEl) { blockedEl.remove(); blockedEl = null; }
   }
 
+  // ---------- small notices shown on the video page ----------
+  let toastEl = null, toastTimer = null;
+  function toast(text, button, onClick, ms = 8000) {
+    hideToast();
+    toastEl = document.createElement('div');
+    const sr = toastEl.attachShadow({ mode: 'closed' });
+    sr.innerHTML = `<style>
+      .t{all:initial;position:fixed;z-index:2147483647;left:50%;bottom:72px;transform:translateX(-50%);display:flex;gap:12px;align-items:center;
+      background:rgba(20,22,28,.95);color:#fff;font:500 15px system-ui,sans-serif;padding:12px 16px;border-radius:12px;box-shadow:0 8px 30px rgba(0,0,0,.5);max-width:90vw}
+      button{all:initial;background:#ff6b4a;color:#fff;font:600 14px system-ui,sans-serif;padding:8px 12px;border-radius:8px;cursor:pointer}
+      .x{background:transparent;opacity:.7}</style><div class="t"><span></span></div>`;
+    const box = sr.querySelector('.t');
+    box.querySelector('span').textContent = text;
+    if (button) {
+      const b = document.createElement('button');
+      b.textContent = button;
+      b.addEventListener('click', ev => { ev.stopPropagation(); onClick(); hideToast(); });
+      box.append(b);
+    }
+    const x = document.createElement('button');
+    x.className = 'x'; x.textContent = '✕';
+    x.addEventListener('click', ev => { ev.stopPropagation(); hideToast(); });
+    box.append(x);
+    (document.fullscreenElement || document.body || document.documentElement).appendChild(toastEl);
+    if (ms) toastTimer = setTimeout(hideToast, ms);
+  }
+  function hideToast() { clearTimeout(toastTimer); if (toastEl) { toastEl.remove(); toastEl = null; } }
+
+  // Player fullscreen covers the side panel (friends + chat). Explain the alternative once.
+  let fsHintShown = false;
+  document.addEventListener('fullscreenchange', () => {
+    if (!document.fullscreenElement || !active || fsHintShown) return;
+    fsHintShown = true;
+    toast('Fullscreen hides your friends and chat. Press Esc, then F11 (or ⌃⌘F on Mac) for full-screen with the panel.', null, null, 9000);
+  });
+
+  // The panel does the syncing. If it's closed, say so instead of silently drifting.
+  let panelGoneShown = false;
+  function checkPanelAlive() {
+    if (!active || !lastWake || Date.now() - lastWake < 12000 || panelGoneShown) return;
+    panelGoneShown = true;
+    active = false; target = null; setDuck(false); cancelPending();
+    toast("CouchSync panel is closed — you're no longer synced with your friends.", 'Reopen', () => {
+      chrome.runtime.sendMessage({ bg: 'open-panel' }).catch(() => {});
+    }, 0);
+  }
+
   // ---------- duck movie volume while friends talk ----------
   function setDuck(on) {
     if (!video || on === duckOn) return;
     duckOn = on;
     if (on) { duckSavedVolume = video.volume; video.volume = Math.max(0, video.volume * 0.35); }
     else if (duckSavedVolume !== null) { video.volume = duckSavedVolume; duckSavedVolume = null; }
+  }
+
+  // ---------- which episode is this? (Prime Video / Hulu keep the same URL across episodes) ----------
+  function readLabel() {
+    if (site !== 'prime' && site !== 'hulu') return '';
+    if (ad) return label; // ads can change the reported title; keep the episode's
+    try {
+      const md = navigator.mediaSession && navigator.mediaSession.metadata;
+      if (md && md.title) return [md.title, md.artist].filter(Boolean).join(' · ').slice(0, 120);
+    } catch {}
+    const el = document.querySelector(site === 'prime' ? '.atvwebplayersdk-subtitle-text' : '.PlayerMetadata__subTitle');
+    return el ? el.textContent.trim().slice(0, 120) : '';
   }
 
   // ---------- status to panel ----------
@@ -288,6 +428,8 @@
       paused: has ? video.paused : true,
       buffering, ad, blocked,
       title: IS_TOP ? document.title : '',
+      label,
+      active,
     };
     const key = `${has}|${buffering}|${ad}|${blocked}`;
     if (!has && !forceSend && lastReportKey === key) return; // frames without video stay quiet
@@ -300,6 +442,13 @@
     if (!msg || !msg.cs) return;
     switch (msg.cs) {
       case 'ping': sendResponse({ ok: true, hasVideo: !!video }); return;
+      case 'wake': {
+        const wasAsleep = !awake();
+        lastWake = Date.now();
+        if (panelGoneShown) { panelGoneShown = false; hideToast(); }
+        if (wasAsleep) tick();
+        break;
+      }
       case 'snapshot':
         sendResponse(video ? { hasVideo: true, currentTime: video.currentTime, paused: video.paused, duration: Number.isFinite(video.duration) ? video.duration : 0 } : { hasVideo: false });
         return;
@@ -322,22 +471,27 @@
         break;
       case 'duck': if (active) setDuck(!!msg.on); break;
       case 'status': report(true); break;
-      case 'deactivate-all': active = false; target = null; setDuck(false); hideBlocked(); break;
+      case 'deactivate-all': active = false; target = null; lastWake = 0; setDuck(false); hideBlocked(); cancelPending(); break;
     }
     sendResponse && sendResponse({ ok: true });
   });
 
   // ---------- main loop ----------
-  setInterval(() => {
+  function tick() {
+    checkPanelAlive();
+    if (!awake()) return; // not in a party: do nothing (saves CPU/battery on every other tab)
     const v = pickVideo();
     if (v !== video) attach(v);
     const wasAd = ad;
     ad = !!video && detectAd();
     if (ad !== wasAd) {
       report(true);
+      if (!ad) settle();
       if (!ad && active) setTimeout(() => applyTarget(true), 500);
     }
+    label = video ? readLabel() : '';
     driftCheck();
     if (video || lastReportKey.startsWith('true')) report(false);
-  }, 1000);
+  }
+  setInterval(tick, 1000);
 })();

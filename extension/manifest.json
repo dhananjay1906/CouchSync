@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "CouchSync",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Watch together in sync with up to 4 friends — live video chat and chat on the side. Free, self-hosted.",
   "minimum_chrome_version": "116",
   "permissions": ["storage", "sidePanel", "tabs", "scripting"],

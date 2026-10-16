@@ -1,6 +1,6 @@
 {
   "name": "couchsync-server",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "CouchSync watch-party sync + signaling server",
   "main": "server.js",
   "directories": {

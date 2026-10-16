@@ -1,0 +1,9 @@
+<!doctype html><title>Prime Video: Test Show</title>
+<body style="margin:0;background:#000"><video id="v" src="/movie.webm" style="width:960px;height:540px" controls></video>
+<script>
+// Like Prime Video: every episode plays on this same page; only the player's title changes.
+let ep = 1;
+function setMeta() { navigator.mediaSession.metadata = new MediaMetadata({ title: 'Test Show', artist: 'S1 E' + ep }); }
+setMeta();
+window.nextEp = () => { ep++; setMeta(); const v = document.getElementById('v'); v.src = '/movie.webm?ep=' + ep; v.load(); };
+</script></body>

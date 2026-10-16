@@ -1,0 +1,10 @@
+<!doctype html><title>YT-like Movie</title>
+<body style="margin:0;background:#000"><video id="v" src="movie.webm" style="width:960px;height:540px" autoplay muted></video>
+<script>
+// Behaves like YouTube: autoplays on load from 0, then "resumes" to the last watched spot with its own seek,
+// and saves position every second.
+const v = document.getElementById('v');
+const saved = +localStorage.getItem('pos') || 0;
+v.addEventListener('loadedmetadata', () => { if (saved > 5) setTimeout(() => { v.currentTime = saved; }, 700); }, { once: true });
+setInterval(() => localStorage.setItem('pos', v.currentTime), 1000);
+</script></body>
